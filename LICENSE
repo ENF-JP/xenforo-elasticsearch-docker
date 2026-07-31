@@ -19,16 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-This licence applies to the contents of this repository only: the build
-scripts, container definitions and documentation.
-
-It grants no rights in XenForo, XenForo Enhanced Search, or any third-party
-add-on, all of which are separately licensed commercial software that this
-repository does not contain or distribute. Elasticsearch, MariaDB, PHP, Apache
-and the container images referenced here are licensed by their respective
-projects.
-
-Not affiliated with or endorsed by XenForo Ltd.

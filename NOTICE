@@ -1,0 +1,29 @@
+Scope of the MIT licence in this repository
+===========================================
+
+The MIT licence in LICENSE applies to the contents of this repository only:
+the build scripts, container definitions and documentation. All of it is
+original work.
+
+It grants no rights in, and this repository does not contain or distribute:
+
+  * XenForo                    - commercial software, (c) XenForo Ltd.
+                                 https://xenforo.com/
+  * XenForo Enhanced Search    - separately licensed XenForo add-on
+  * any third-party XenForo add-on
+
+You must supply your own licensed copy of XenForo, via the XF_SOURCE setting
+in stack/.env. Nothing in this repository will function without it, by design.
+
+Container images referenced by stack/docker-compose.yml are licensed by their
+respective projects and are downloaded from their own registries at build time,
+not redistributed here:
+
+  * php:8.3-apache             - PHP License / Apache License 2.0
+  * mariadb:11.4               - GPL v2
+  * elasticsearch:8.15.0       - Elastic License 2.0 / SSPL / AGPL (see Elastic)
+  * axllent/mailpit            - MIT (optional service, not started by default)
+
+This project is not affiliated with, endorsed by, or sponsored by XenForo Ltd.,
+Elastic N.V., MariaDB Foundation, or Docker Inc. Trademarks belong to their
+respective owners.

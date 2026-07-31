@@ -120,8 +120,8 @@ Per-platform install steps are in the platform documents above.
 
 ## Licence
 
-[MIT](LICENSE) — for the scripts, container definitions and documentation in this repository.
+[MIT](LICENSE) — for the scripts, container definitions and documentation in this repository, all of which are original work.
 
-This licence covers **this repository's contents only**. It grants you nothing with respect to XenForo, XenForo Enhanced Search, or any third-party add-on; those remain subject to their own licences. Elasticsearch, MariaDB, PHP and the other images are licensed by their respective projects.
+This licence covers **this repository's contents only**. It grants you nothing with respect to XenForo, XenForo Enhanced Search, or any third-party add-on; those remain subject to their own licences, and none of them are contained or distributed here. Elasticsearch, MariaDB, PHP and the other images are licensed by their respective projects and pulled from their own registries at build time. See [NOTICE](NOTICE) for the full breakdown.
 
 Not affiliated with or endorsed by XenForo Ltd.
