@@ -17,7 +17,7 @@ cd xenforo-elasticsearch-docker
 
 ## ⚠️ Read this before you change a `ports:` line
 
-**The environment this repo is derived from was compromised in roughly 76 minutes.**
+**The whole reason we have decided to build this repo is related to a test environment that was purposely exposed to the open internet. The test environment this repo is derived from was compromised in roughly 76 minutes. Vigilance in security is a must, no longer is ever just a consideration.**
 
 An early version published MariaDB as `"3306:3306"` with weak credentials. Docker reads a bare `host:container` mapping as `0.0.0.0` — every interface — and installs its own NAT rules, so the host firewall did not block it. An automated scanner found it, dropped the database, and left a `RECOVER_YOUR_DATA` ransom table.
 
