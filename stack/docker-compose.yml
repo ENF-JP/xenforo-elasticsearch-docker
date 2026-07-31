@@ -1,0 +1,184 @@
+# XenForo + Elasticsearch + MariaDB — local development stack
+#
+# Works identically on Linux, macOS and Windows (WSL2). Nothing in this file is
+# platform-specific; the differences live in the helper scripts and the docs.
+#
+# ---------------------------------------------------------------------------
+# SECURITY — read docs/SECURITY.md before changing any `ports:` entry
+# ---------------------------------------------------------------------------
+# Docker interprets a bare "host:container" mapping as 0.0.0.0 — EVERY network
+# interface — and it installs its own iptables/NAT rules, so a host firewall
+# does not necessarily block it.
+#
+# The stack this file is derived from published MariaDB that way, once, with
+# weak credentials. An automated scanner found it in roughly 76 minutes,
+# dropped the database and left a ransom table behind. See docs/SECURITY.md.
+#
+# Rules enforced here:
+#   1. Every published port carries an explicit 127.0.0.1: prefix.
+#   2. Databases and search nodes are not published at all. Containers reach
+#      each other over the compose network by service name.
+#   3. No default credentials anywhere. Everything comes from .env, which the
+#      helper scripts generate with long random values.
+# ---------------------------------------------------------------------------
+
+name: xenforo-dev
+
+services:
+
+  # ---------------------------------------------------------------------
+  # Database
+  # ---------------------------------------------------------------------
+  mariadb:
+    image: mariadb:11.4
+    container_name: ${COMPOSE_PREFIX:-xf}-mariadb
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD:?set it in .env — run the setup script to generate one}
+      MARIADB_DATABASE: ${MARIADB_DATABASE:-xenforo}
+      MARIADB_USER: ${MARIADB_USER:-xenforo}
+      MARIADB_PASSWORD: ${MARIADB_PASSWORD:?set it in .env — run the setup script to generate one}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_general_ci
+      - --innodb-buffer-pool-size=${MARIADB_BUFFER_POOL:-512M}
+      - --max-allowed-packet=64M
+    # DELIBERATELY NOT PUBLISHED. Uncomment ONLY if a GUI client on the host
+    # needs it, and keep the 127.0.0.1 prefix when you do.
+    # ports:
+    #   - "127.0.0.1:3306:3306"
+    volumes:
+      # Named volume, never a bind mount: bind-mounting a MySQL/MariaDB data
+      # directory onto a Windows or macOS filesystem corrupts InnoDB through
+      # file-locking differences.
+      - mariadb-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # ---------------------------------------------------------------------
+  # Search backend for XenForo Enhanced Search (XFES)
+  # ---------------------------------------------------------------------
+  # SECURITY: no `ports:` entry, and there must never be one. With
+  # xpack.security.enabled=false this node accepts unauthenticated requests
+  # from anyone who can reach it and will happily serve `DELETE /_all`. That is
+  # a strictly worse exposure than an open database. Query it from inside the
+  # web container instead — the helper scripts' `es` command does exactly that.
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:${ES_VERSION:-8.15.0}
+    container_name: ${COMPOSE_PREFIX:-xf}-elasticsearch
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - xpack.security.enrollment.enabled=false
+      # Heap must be <= 50% of mem_limit below, per Elastic's guidance.
+      # Raising ES_JAVA_OPTS without raising ES_MEM_LIMIT gets the JVM
+      # OOM-killed under load.
+      - ES_JAVA_OPTS=-Xms${ES_HEAP:-1g} -Xmx${ES_HEAP:-1g}
+      # A dev box is usually short on disk. Without this, Elasticsearch flips
+      # the index to read-only at the 95% flood stage and every subsequent
+      # index request fails with a confusing error.
+      - cluster.routing.allocation.disk.threshold_enabled=false
+      # Refuse wildcard deletes (DELETE /_all, DELETE /*).
+      - action.destructive_requires_name=true
+    mem_limit: ${ES_MEM_LIMIT:-2g}
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+    healthcheck:
+      # `curl -f` fails on any non-2xx, which is what we want while the node is
+      # still starting. green OR yellow counts as healthy: a single-node
+      # cluster can never allocate replica shards, so yellow is its steady
+      # state, not a fault.
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  # ---------------------------------------------------------------------
+  # Web / PHP
+  # ---------------------------------------------------------------------
+  xenforo:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        PHP_VERSION: ${PHP_VERSION:-8.3}
+        PHP_TIMEZONE: ${PHP_TIMEZONE:-UTC}
+        # Linux only: align the container's www-data with your host user so a
+        # bind-mounted webroot is writable from both sides. The Linux setup
+        # script fills these in from `id -u` / `id -g`. Leave at 33 on Windows
+        # and macOS, where Docker Desktop translates ownership for you.
+        PUID: ${PUID:-33}
+        PGID: ${PGID:-33}
+    image: xenforo-dev-php:${PHP_VERSION:-8.3}-${PUID:-33}
+    container_name: ${COMPOSE_PREFIX:-xf}-web
+    restart: unless-stopped
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    environment:
+      # config.php reads these via getenv(), so no password is ever written
+      # into a file that could be committed.
+      XF_DB_HOST: mariadb
+      XF_DB_NAME: ${MARIADB_DATABASE:-xenforo}
+      XF_DB_USER: ${MARIADB_USER:-xenforo}
+      XF_DB_PASSWORD: ${MARIADB_PASSWORD:?set it in .env}
+    ports:
+      # Loopback only. This is a development box, not a server.
+      # Change the host port with HTTP_PORT in .env; never drop the 127.0.0.1.
+      - "127.0.0.1:${HTTP_PORT:-80}:80"
+    extra_hosts:
+      # Lets Xdebug inside the container reach an IDE on the host.
+      # Docker Desktop provides this name natively; on Linux the mapping below
+      # is what makes it work.
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # ---- webroot -----------------------------------------------------
+      # A working copy of YOUR licensed XenForo files. The setup script
+      # populates it from a path or zip you supply. XenForo source is NOT
+      # distributed with this repo — see README.md.
+      - ${XF_WEBROOT:-./webroot}:/var/www/html
+
+      # ---- add-ons under active development ----------------------------
+      # Mount at ADD-ON level, not vendor level: mounting .../addons/Vendor
+      # would shadow every other add-on from that vendor in the webroot.
+      # Copy a line per add-on you are working on.
+      #
+      # - ../MyAddon/upload/src/addons/Vendor/AddonId:/var/www/html/src/addons/Vendor/AddonId
+      # - ../MyAddon/upload/js/Vendor:/var/www/html/js/Vendor
+
+  # ---------------------------------------------------------------------
+  # Optional: mail catcher. Start with `--profile mail`.
+  # ---------------------------------------------------------------------
+  # XenForo dev config sets enableMail = false by default. If you need to
+  # exercise real mail flows (registration, password reset), set
+  # enableMail = true, point XenForo's SMTP at host `mailpit` port 1025, and
+  # read the messages at http://localhost:8025.
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: ${COMPOSE_PREFIX:-xf}-mailpit
+    restart: unless-stopped
+    profiles: ["mail"]
+    ports:
+      - "127.0.0.1:${MAILPIT_PORT:-8025}:8025"
+    environment:
+      - MP_MAX_MESSAGES=500
+      - MP_SMTP_AUTH_ACCEPT_ANY=1
+      - MP_SMTP_AUTH_ALLOW_INSECURE=1
+
+volumes:
+  mariadb-data:
+  es-data:

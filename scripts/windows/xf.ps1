@@ -1,0 +1,558 @@
+<#
+    XenForo + Elasticsearch dev stack - Windows helper.
+
+    Wraps docker compose so day-to-day commands are short, and resolves
+    docker.exe explicitly so it still works in a shell that was open before
+    Docker was installed (a very common first-run failure).
+
+    Usage:  .\xf.ps1 <command> [args]
+            .\xf.ps1 help
+
+    Tested on Windows PowerShell 5.1 and PowerShell 7. Several constructs here
+    look roundabout; each one works around a real PowerShell 5.1 behaviour that
+    is documented inline. Please read the comment before "simplifying" one.
+#>
+[CmdletBinding()]
+param(
+    [Parameter(Position = 0)]
+    [string] $Command = 'help',
+
+    # Not named $Args: that collides with PowerShell's automatic variable.
+    [Parameter(Position = 1, ValueFromRemainingArguments = $true)]
+    [string[]] $Rest
+)
+
+$ErrorActionPreference = 'Stop'
+
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$StackDir  = (Resolve-Path (Join-Path $ScriptDir '..\..\stack')).Path
+$EnvFile   = Join-Path $StackDir '.env'
+
+# ---- locate docker ---------------------------------------------------------
+function Get-DockerExe {
+    # -CommandType Application matters: without it this resolves to any alias or
+    # function named "docker" - including one defined in this script - and a
+    # FunctionInfo has an empty .Source, which yields "" and breaks the & call.
+    $cmd = Get-Command docker -CommandType Application -ErrorAction SilentlyContinue |
+           Select-Object -First 1
+    if ($cmd) { return $cmd.Source }
+
+    $candidates = @(
+        "$env:ProgramFiles\Docker\Docker\resources\bin\docker.exe",
+        "${env:ProgramFiles(x86)}\Docker\Docker\resources\bin\docker.exe",
+        "$env:LOCALAPPDATA\Programs\Docker\Docker\resources\bin\docker.exe",
+        "$env:ProgramFiles\RancherDesktop\resources\resources\win32\bin\docker.exe",
+        "$env:LOCALAPPDATA\Programs\Rancher Desktop\resources\resources\win32\bin\docker.exe"
+    )
+    foreach ($c in $candidates) { if (Test-Path $c) { return $c } }
+
+    throw "docker.exe not found. Install Docker Desktop or Rancher Desktop, start it, open a NEW terminal, then retry. See docs/platform-windows.md."
+}
+
+# Resolved lazily so `help` works before Docker is installed.
+# NOT named "Docker": a function by that name shadows the docker command itself.
+$script:DockerExe = $null
+function Resolve-DockerBin {
+    if (-not $script:DockerExe) { $script:DockerExe = Get-DockerExe }
+    return $script:DockerExe
+}
+
+# ---- native-command invocation ---------------------------------------------
+# Docker writes progress and much of its normal output to STDERR. Under
+# PowerShell 5.1, if that stderr is redirected anywhere (a caller's 2>&1, a CI
+# log, an agent capturing output) each line is wrapped in an ErrorRecord; with
+# $ErrorActionPreference = 'Stop' the first such line aborts the script even
+# though docker exited 0. Every native call below therefore relaxes the
+# preference and reports success from $LASTEXITCODE alone.
+
+function Invoke-Docker {
+    <#
+      Streams docker's output to the console and returns ONLY the exit code.
+
+      Out-Host is essential: without it docker's stdout joins this function's
+      output stream, so the caller receives @(<output lines>, <exit code>).
+      Comparing that array to 0 yields a non-empty array, which is truthy - so
+      a perfectly successful build reports failure.
+    #>
+    param([Parameter(Mandatory)][string[]] $Arguments)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & (Resolve-DockerBin) $Arguments | Out-Host
+        return $LASTEXITCODE
+    }
+    finally { $ErrorActionPreference = $prev }
+}
+
+function Invoke-DockerInteractive {
+    <# For TTY sessions: no Out-Host and no capture, so the terminal passes through. #>
+    param([Parameter(Mandatory)][string[]] $Arguments)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { & (Resolve-DockerBin) $Arguments }
+    finally { $ErrorActionPreference = $prev }
+}
+
+function Get-DockerOutput {
+    <# Captures stdout as lines, discarding stderr so no ErrorRecords form. #>
+    param([Parameter(Mandatory)][string[]] $Arguments)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { return (& (Resolve-DockerBin) $Arguments 2>$null) }
+    finally { $ErrorActionPreference = $prev }
+}
+
+function Invoke-Compose {
+    param([string[]] $ComposeArgs)
+    Push-Location $StackDir
+    # Parentheses matter: without them PowerShell passes "+" as an argument.
+    try { return (Invoke-Docker (@('compose') + $ComposeArgs)) }
+    finally { Pop-Location }
+}
+
+function Get-ComposeOutput {
+    param([string[]] $ComposeArgs)
+    Push-Location $StackDir
+    try { return (Get-DockerOutput (@('compose') + $ComposeArgs)) }
+    finally { Pop-Location }
+}
+
+function Invoke-InContainer {
+    <# Runs a command in the web container as www-data unless -AsRoot. #>
+    param([string[]] $Cmd, [switch] $AsRoot)
+    $pre = @('exec', '-T')
+    if (-not $AsRoot) { $pre += @('-u', 'www-data') }
+    $pre += 'xenforo'
+    return (Invoke-Compose ($pre + $Cmd))
+}
+
+function Get-FromContainer {
+    param([string[]] $Cmd)
+    return (Get-ComposeOutput (@('exec', '-T', 'xenforo') + $Cmd))
+}
+
+function Assert-Running {
+    $out = Get-ComposeOutput @('ps', '--services', '--filter', 'status=running')
+    if ($out -notmatch 'xenforo') {
+        throw "The web container is not running. Start it with: .\xf.ps1 up"
+    }
+}
+
+# ---- .env handling ---------------------------------------------------------
+function Get-EnvValue {
+    param([Parameter(Mandatory)][string] $Key)
+    if (-not (Test-Path $EnvFile)) { throw ".env not found at $EnvFile - run: .\xf.ps1 setup" }
+    foreach ($line in Get-Content $EnvFile) {
+        if ($line -match "^\s*$([regex]::Escape($Key))\s*=\s*(.*)$") { return $Matches[1].Trim() }
+    }
+    return $null
+}
+
+function Set-EnvValue {
+    param([Parameter(Mandatory)][string] $Key, [Parameter(Mandatory)][string] $Value)
+    $lines = @(Get-Content $EnvFile)
+    $found = $false
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match "^\s*$([regex]::Escape($Key))\s*=") {
+            $lines[$i] = "$Key=$Value"; $found = $true; break
+        }
+    }
+    if (-not $found) { $lines += "$Key=$Value" }
+    # .NET writer with explicit LF: Out-File would emit CRLF, and docker compose
+    # tolerates it but shell-based tooling reading the same file does not.
+    [System.IO.File]::WriteAllText($EnvFile, (($lines -join "`n") + "`n"), (New-Object System.Text.UTF8Encoding($false)))
+}
+
+function New-Secret {
+    param([int] $Length = 32)
+    # Alphanumeric only: '/', '+' and '=' from base64 need escaping in .env,
+    # in connection strings and in shell arguments. Not worth the trouble.
+    $chars = (48..57) + (65..90) + (97..122)
+    $rng   = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    $bytes = New-Object byte[] $Length
+    $rng.GetBytes($bytes)
+    -join ($bytes | ForEach-Object { [char]$chars[$_ % $chars.Count] })
+}
+
+function Assert-NoPublicBind {
+    <#
+      Refuses to stay quiet if a container port is bound to all interfaces.
+      The stack this is derived from was compromised in ~76 minutes because of
+      a bare "3306:3306". See docs/SECURITY.md.
+    #>
+    $rows = Get-DockerOutput @('ps', '--format', '{{.Names}}|{{.Ports}}')
+    $bad = @()
+    foreach ($r in $rows) {
+        if (-not $r) { continue }
+        $name, $ports = $r -split '\|', 2
+        if ($ports -match '0\.0\.0\.0:|\[::\]:') { $bad += "$name -> $ports" }
+    }
+    if ($bad.Count) {
+        Write-Host "WARNING: container ports are published on ALL interfaces:" -ForegroundColor Red
+        $bad | ForEach-Object { Write-Host "    $_" -ForegroundColor Red }
+        Write-Host "  Bind them to 127.0.0.1 in docker-compose.yml, then: .\xf.ps1 down; .\xf.ps1 up" -ForegroundColor Red
+        Write-Host "  Read docs/SECURITY.md before continuing." -ForegroundColor Red
+    }
+}
+
+# ---- commands --------------------------------------------------------------
+switch ($Command.ToLower()) {
+
+    'help' {
+@"
+XenForo + Elasticsearch dev stack (Windows)
+
+  First run
+    setup                 Generate .env, build the image, start, install XenForo
+    reset                 Destroy containers, volumes and webroot, then set up again
+
+  Lifecycle
+    up | down | restart   Start / stop / restart
+    status                Container and health status
+    build                 Rebuild the PHP image (after editing Dockerfile)
+
+  XenForo
+    cli <args...>         php cmd.php <args>   e.g.  cli xf:addon-list
+    addon install|upgrade|enable|disable|uninstall <Vendor/Id>
+    import <Vendor/Id>    xf-dev:import --addon=<Vendor/Id>
+    export <Vendor/Id>    xf-addon:export <Vendor/Id>
+    rebuild               xf-dev:rebuild-caches
+    reindex               xf-rebuild:search  (full Elasticsearch reindex)
+    defaultaddon <V/Id>   Set development.defaultAddOn in config.php
+
+  Diagnostics
+    doctor                Check ports, PHP extensions, DB, Elasticsearch, HTTP
+    errors [n]            Show the last n XenForo errors (default 5)
+    log                   Tail the Apache error log
+    shell                 Bash shell in the web container
+    db                    MariaDB client
+    es [path]             Query Elasticsearch  (default: _cat/indices?v)
+    xdebug on|off         Toggle Xdebug (off is roughly twice as fast)
+    creds                 Show the ACP URL and admin credentials
+
+  Every published port binds to 127.0.0.1 only. See docs/SECURITY.md.
+"@ | Write-Host
+    }
+
+    'setup' {
+        # ---- .env -------------------------------------------------------
+        if (-not (Test-Path $EnvFile)) {
+            Copy-Item (Join-Path $StackDir '.env.example') $EnvFile
+            Write-Host "Created stack\.env from .env.example"
+        }
+
+        foreach ($k in 'MARIADB_ROOT_PASSWORD', 'MARIADB_PASSWORD', 'XF_ADMIN_PASSWORD') {
+            if (-not (Get-EnvValue $k)) {
+                $len = 32; if ($k -eq 'XF_ADMIN_PASSWORD') { $len = 24 }
+                Set-EnvValue $k (New-Secret -Length $len)
+                Write-Host "Generated $k"
+            }
+        }
+        if (-not (Get-EnvValue 'XF_ADMIN_USER')) { Set-EnvValue 'XF_ADMIN_USER' 'admin' }
+
+        # ---- webroot ----------------------------------------------------
+        $webrootRel = Get-EnvValue 'XF_WEBROOT'
+        if (-not $webrootRel) { $webrootRel = './webroot' }
+        $Webroot = Join-Path $StackDir ($webrootRel -replace '^\./', '')
+
+        if (-not (Test-Path $Webroot)) {
+            $source = Get-EnvValue 'XF_SOURCE'
+            if (-not $source) {
+                throw @"
+XF_SOURCE is not set in stack\.env.
+
+XenForo is commercial software and is not distributed with this repo. Point
+XF_SOURCE at your own licensed copy - either an unpacked directory containing
+src\ and cmd.php, or the upload\ directory from a XenForo release zip:
+
+    XF_SOURCE=G:\sources\xenforo_2.3.12\upload
+"@
+            }
+            if (-not (Test-Path $source)) { throw "XF_SOURCE path does not exist: $source" }
+
+            if ((Get-Item $source).PSIsContainer) {
+                if (-not (Test-Path (Join-Path $source 'cmd.php'))) {
+                    throw "XF_SOURCE does not look like a XenForo webroot (no cmd.php): $source"
+                }
+                Write-Host "Copying XenForo source -> $Webroot (one-time, ~65 MB, takes a minute)..."
+                Copy-Item $source $Webroot -Recurse -Force
+            }
+            elseif ($source -like '*.zip') {
+                Write-Host "Extracting $source -> $Webroot ..."
+                Add-Type -AssemblyName System.IO.Compression.FileSystem
+                $tmp = Join-Path $env:TEMP ("xfsrc-" + [guid]::NewGuid().ToString('N'))
+                [System.IO.Compression.ZipFile]::ExtractToDirectory($source, $tmp)
+                # A XenForo release zip wraps everything in upload/.
+                $inner = Join-Path $tmp 'upload'
+                if (Test-Path $inner) { Copy-Item $inner $Webroot -Recurse -Force }
+                else { Copy-Item $tmp $Webroot -Recurse -Force }
+                Remove-Item $tmp -Recurse -Force
+            }
+            else { throw "XF_SOURCE must be a directory or a .zip file: $source" }
+        }
+        else {
+            Write-Host "Webroot already exists; leaving it alone."
+        }
+
+        $cfg = Join-Path $Webroot 'src\config.php'
+        if (-not (Test-Path $cfg)) {
+            Copy-Item (Join-Path $StackDir 'config.php.template') $cfg -Force
+            Write-Host "Installed development config.php"
+        }
+        foreach ($d in 'data', 'internal_data') {
+            $p = Join-Path $Webroot $d
+            if (-not (Test-Path $p)) { New-Item -ItemType Directory -Force $p | Out-Null }
+        }
+
+        # ---- build and start --------------------------------------------
+        Write-Host "`nBuilding image (first build takes a few minutes)..."
+        if ((Invoke-Compose @('build')) -ne 0) { throw "Image build failed." }
+
+        Write-Host "`nStarting containers..."
+        if ((Invoke-Compose @('up', '-d')) -ne 0) { throw "Failed to start containers." }
+
+        Write-Host "`nWaiting for MariaDB and Elasticsearch to report healthy..."
+        $prefix = Get-EnvValue 'COMPOSE_PREFIX'; if (-not $prefix) { $prefix = 'xf' }
+        foreach ($svc in "$prefix-mariadb", "$prefix-elasticsearch") {
+            $ok = $false
+            foreach ($i in 1..90) {
+                $h = Get-DockerOutput @('inspect', '-f', '{{.State.Health.Status}}', $svc)
+                if ($h -eq 'healthy') { $ok = $true; break }
+                Start-Sleep -Seconds 2
+            }
+            if (-not $ok) { throw "$svc did not become healthy. Check: .\xf.ps1 status" }
+            Write-Host "  $svc healthy"
+        }
+
+        # Bind-mounted Windows files can land with awkward ownership.
+        Invoke-InContainer -AsRoot @('chown', '-R', 'www-data:www-data', '/var/www/html/data', '/var/www/html/internal_data') | Out-Null
+
+        # The database lives in a Docker volume but internal_data/ lives on the
+        # host, so destroying the volume leaves install-lock.php behind and
+        # XenForo then refuses to install. Decide from the DATABASE whether this
+        # is a fresh install - never from the lock file alone, or re-running
+        # setup could wipe a working install.
+        $dbUser = Get-EnvValue 'MARIADB_USER'; if (-not $dbUser) { $dbUser = 'xenforo' }
+        $dbName = Get-EnvValue 'MARIADB_DATABASE'; if (-not $dbName) { $dbName = 'xenforo' }
+        $dbPass = Get-EnvValue 'MARIADB_PASSWORD'
+        $tables = Get-ComposeOutput @('exec', '-T', 'mariadb', 'mariadb', "-u$dbUser", "-p$dbPass", $dbName, '-e', 'SHOW TABLES')
+        $tableCount = @($tables | Where-Object { $_ -and $_ -notmatch '^Tables_in_' }).Count
+
+        if ($tableCount -gt 0) {
+            Write-Host "`nXenForo is already installed ($tableCount tables) - skipping install."
+            Write-Host "To start over: .\xf.ps1 reset"
+        }
+        else {
+            $lock = Join-Path $Webroot 'internal_data\install-lock.php'
+            if (Test-Path $lock) {
+                Write-Host "`nDatabase is empty but install-lock.php exists (left by a previous"
+                Write-Host "install whose volume was destroyed). Clearing stale install state..."
+                Remove-Item $lock -Force
+                foreach ($stale in 'internal_data\code_cache', 'internal_data\temp') {
+                    $sp = Join-Path $Webroot $stale
+                    if (Test-Path $sp) { Remove-Item $sp -Recurse -Force -ErrorAction SilentlyContinue }
+                }
+            }
+
+            Write-Host "`nInstalling XenForo..."
+            $adminUser = Get-EnvValue 'XF_ADMIN_USER'
+            $adminPass = Get-EnvValue 'XF_ADMIN_PASSWORD'
+            if (-not $adminPass) { throw "XF_ADMIN_PASSWORD is not set in .env" }
+            if ((Invoke-InContainer @('php', 'cmd.php', 'xf:install', "--user=$adminUser", "--password=$adminPass", '--clear')) -ne 0) {
+                throw "xf:install failed. Inspect with: .\xf.ps1 log"
+            }
+        }
+
+        Assert-NoPublicBind
+
+        $port = Get-EnvValue 'HTTP_PORT'; if (-not $port) { $port = '80' }
+        $url  = "http://localhost"; if ($port -ne '80') { $url = "http://localhost:$port" }
+        Write-Host "`nDone. $url/admin.php"
+        Write-Host "Credentials: .\xf.ps1 creds"
+        Write-Host "Next: mount an add-on in stack\docker-compose.yml, then .\xf.ps1 addon install Vendor/AddonId"
+    }
+
+    'reset' {
+        Write-Host "This destroys the containers, all volumes (database AND search index), and the webroot." -ForegroundColor Yellow
+        $c = Read-Host "Type RESET to confirm"
+        if ($c -ne 'RESET') { Write-Host "Aborted."; break }
+        Invoke-Compose @('down', '-v') | Out-Null
+        $webrootRel = Get-EnvValue 'XF_WEBROOT'; if (-not $webrootRel) { $webrootRel = './webroot' }
+        $Webroot = Join-Path $StackDir ($webrootRel -replace '^\./', '')
+        if (Test-Path $Webroot) { Remove-Item $Webroot -Recurse -Force }
+        & $PSCommandPath 'setup'
+    }
+
+    'up'      { Invoke-Compose @('up', '-d') | Out-Null; Invoke-Compose @('ps') | Out-Null; Assert-NoPublicBind }
+    'down'    { Invoke-Compose @('down') | Out-Null }
+    'restart' { Invoke-Compose @('restart') | Out-Null }
+    'build'   { Invoke-Compose @('build') | Out-Null }
+    'status'  { Invoke-Compose @('ps') | Out-Null }
+
+    'cli' {
+        Assert-Running
+        Invoke-InContainer (@('php', 'cmd.php') + $Rest) | Out-Null
+    }
+
+    'addon' {
+        Assert-Running
+        if ($Rest.Count -lt 2) { throw "Usage: .\xf.ps1 addon install|upgrade|enable|disable|uninstall <Vendor/Id>" }
+        $action = $Rest[0]; $id = $Rest[1]
+        $map = @{
+            'install'   = 'xf:addon-install';   'upgrade' = 'xf:addon-upgrade'
+            'enable'    = 'xf:addon-enable';    'disable' = 'xf:addon-disable'
+            'uninstall' = 'xf:addon-uninstall'
+        }
+        if (-not $map.ContainsKey($action)) { throw "Unknown action '$action'." }
+        Invoke-InContainer @('php', 'cmd.php', $map[$action], $id) | Out-Null
+    }
+
+    'import' {
+        Assert-Running
+        if (-not $Rest) { throw "Usage: .\xf.ps1 import <Vendor/Id>" }
+        Invoke-InContainer @('php', 'cmd.php', 'xf-dev:import', "--addon=$($Rest[0])") | Out-Null
+    }
+
+    'export' {
+        Assert-Running
+        if (-not $Rest) { throw "Usage: .\xf.ps1 export <Vendor/Id>" }
+        Invoke-InContainer @('php', 'cmd.php', 'xf-addon:export', $Rest[0]) | Out-Null
+    }
+
+    'rebuild' { Assert-Running; Invoke-InContainer @('php', 'cmd.php', 'xf-dev:rebuild-caches') | Out-Null }
+
+    'reindex' {
+        # The command is xf-rebuild:search. AbstractRebuildCommand builds every
+        # rebuild command as xf-rebuild:<name>; there is no xf:rebuild-search.
+        Assert-Running
+        Invoke-InContainer (@('php', 'cmd.php', 'xf-rebuild:search') + $Rest) | Out-Null
+    }
+
+    'defaultaddon' {
+        if (-not $Rest) { throw "Usage: .\xf.ps1 defaultaddon <Vendor/Id>" }
+        $webrootRel = Get-EnvValue 'XF_WEBROOT'; if (-not $webrootRel) { $webrootRel = './webroot' }
+        $cfg = Join-Path (Join-Path $StackDir ($webrootRel -replace '^\./', '')) 'src\config.php'
+        $txt = Get-Content $cfg -Raw
+        $new = [regex]::Replace($txt, "(\`$config\['development'\]\['defaultAddOn'\]\s*=\s*')[^']*(')", "`${1}$($Rest[0])`${2}")
+        [System.IO.File]::WriteAllText($cfg, $new)
+        Write-Host "development.defaultAddOn = $($Rest[0])"
+    }
+
+    'creds' {
+        $port = Get-EnvValue 'HTTP_PORT'; if (-not $port) { $port = '80' }
+        $url  = "http://localhost"; if ($port -ne '80') { $url = "http://localhost:$port" }
+        Write-Host "URL      : $url/admin.php"
+        Write-Host "Username : $(Get-EnvValue 'XF_ADMIN_USER')"
+        Write-Host "Password : $(Get-EnvValue 'XF_ADMIN_PASSWORD')"
+    }
+
+    'doctor' {
+        Write-Host "=== containers ==="
+        Invoke-Compose @('ps') | Out-Null
+
+        Write-Host "`n=== port exposure ==="
+        Assert-NoPublicBind
+        Write-Host "  (no warning above = every published port is loopback-only)"
+
+        Write-Host "`n=== PHP extensions XenForo 2.3 needs ==="
+        # `php -m` deliberately, not `php -r 'implode(...)'`: PowerShell 5.1
+        # mangles double quotes inside a native command's arguments, so the -r
+        # variant reaches PHP malformed and reports every extension missing.
+        # -m needs no quoting at all.
+        $required = 'mysqli','gd','json','pcre','ctype','iconv','mbstring','openssl','SimpleXML','filter','hash','session','zip','intl','curl','zlib'
+        $have = Get-FromContainer @('php', '-m')
+        $missing = 0
+        foreach ($e in $required) {
+            if ($have | Where-Object { $_.Trim() -ieq $e }) { Write-Host ("  ok      {0}" -f $e) }
+            else { Write-Host ("  MISSING {0}" -f $e) -ForegroundColor Red; $missing++ }
+        }
+        if ($missing) { Write-Host "  -> $missing missing; add to the Dockerfile and run: .\xf.ps1 build" -ForegroundColor Red }
+
+        Write-Host "`n=== PHP version ==="
+        Get-FromContainer @('php', '-v') | Select-Object -First 1
+
+        Write-Host "`n=== database ==="
+        # SHOW TABLES, not a SELECT with a quoted table_schema - same PowerShell
+        # 5.1 quoting problem as above.
+        $dbUser = Get-EnvValue 'MARIADB_USER'; if (-not $dbUser) { $dbUser = 'xenforo' }
+        $dbName = Get-EnvValue 'MARIADB_DATABASE'; if (-not $dbName) { $dbName = 'xenforo' }
+        $dbPass = Get-EnvValue 'MARIADB_PASSWORD'
+        $tbl = Get-ComposeOutput @('exec', '-T', 'mariadb', 'mariadb', "-u$dbUser", "-p$dbPass", $dbName, '-e', 'SHOW TABLES')
+        $count = @($tbl | Where-Object { $_ -and $_ -notmatch '^Tables_in_' }).Count
+        if ($count -gt 0) { Write-Host "  ok      $count tables in '$dbName'" }
+        else { Write-Host "  no tables found - has XenForo been installed?" -ForegroundColor Red }
+
+        Write-Host "`n=== Elasticsearch ==="
+        # Queried from inside the web container on purpose: Elasticsearch is not
+        # published to the host and must never be.
+        $esHealth = Get-FromContainer @('curl', '-fsS', 'http://elasticsearch:9200/_cluster/health')
+        if ($esHealth) {
+            $esJoined = ($esHealth -join '')
+            if ($esJoined -match '"status"\s*:\s*"(green|yellow)"') {
+                # yellow is normal for a single node: replica shards stay unassigned.
+                Write-Host "  ok      cluster status $($Matches[1])"
+                $esCount = (Get-FromContainer @('curl', '-fsS', 'http://elasticsearch:9200/xf/_count')) -join ''
+                if ($esCount -match '"count"\s*:\s*(\d+)') { Write-Host "  ok      index 'xf' holds $($Matches[1]) document(s)" }
+                else { Write-Host "  index 'xf' not found - run the XFES setup wizard in the ACP" -ForegroundColor Yellow }
+            }
+            else { Write-Host "  cluster unhealthy: $esJoined" -ForegroundColor Red }
+        }
+        else { Write-Host "  not reachable - XFES will fall back to MySQL search" -ForegroundColor Yellow }
+
+        Write-Host "`n=== HTTP ==="
+        $port = Get-EnvValue 'HTTP_PORT'; if (-not $port) { $port = '80' }
+        $url  = "http://localhost"; if ($port -ne '80') { $url = "http://localhost:$port" }
+        try {
+            $r = Invoke-WebRequest -Uri "$url/" -UseBasicParsing -TimeoutSec 15
+            Write-Host "  $url -> $($r.StatusCode)"
+        } catch { Write-Host "  $url FAILED: $($_.Exception.Message)" -ForegroundColor Red }
+
+        Write-Host "`n=== installed add-ons ==="
+        Invoke-InContainer @('php', 'cmd.php', 'xf:addon-list') | Out-Null
+    }
+
+    'errors' {
+        $n = 5
+        if ($Rest -and $Rest[0] -match '^\d+$') { $n = [int]$Rest[0] }
+        $webrootRel = Get-EnvValue 'XF_WEBROOT'; if (-not $webrootRel) { $webrootRel = './webroot' }
+        $logPath = Join-Path (Join-Path $StackDir ($webrootRel -replace '^\./', '')) 'internal_data\error_log.php'
+        if (-not (Test-Path $logPath)) { Write-Host "No error_log.php yet - nothing has errored."; break }
+        # XenForo writes each entry as a PHP block; show the tail of the raw file.
+        Get-Content $logPath -Tail ($n * 12)
+    }
+
+    'log'   { Invoke-DockerInteractive @('compose', '--project-directory', $StackDir, 'logs', '--tail', '80', '-f', 'xenforo') }
+    'shell' { Assert-Running; Invoke-DockerInteractive @('compose', '--project-directory', $StackDir, 'exec', '-u', 'www-data', 'xenforo', 'bash') }
+
+    'db' {
+        $dbUser = Get-EnvValue 'MARIADB_USER'; if (-not $dbUser) { $dbUser = 'xenforo' }
+        $dbName = Get-EnvValue 'MARIADB_DATABASE'; if (-not $dbName) { $dbName = 'xenforo' }
+        Invoke-DockerInteractive @('compose', '--project-directory', $StackDir, 'exec', 'mariadb', 'mariadb', "-u$dbUser", "-p$(Get-EnvValue 'MARIADB_PASSWORD')", $dbName)
+    }
+
+    'es' {
+        # Queried through the web container because Elasticsearch has no
+        # published port and must not get one - it is unauthenticated.
+        Assert-Running
+        $path = '_cat/indices?v'
+        if ($Rest -and $Rest[0]) { $path = $Rest[0] }
+        $path = $path.TrimStart('/')
+        Invoke-InContainer @('curl', '-fsS', "http://elasticsearch:9200/$path") | Out-Null
+        Write-Host ""
+    }
+
+    'xdebug' {
+        if (-not $Rest) { throw "Usage: .\xf.ps1 xdebug on|off" }
+        $dir = '/usr/local/etc/php/conf.d'
+        if ($Rest[0] -ieq 'on') {
+            Invoke-InContainer -AsRoot @('sh', '-c', "cp $dir/zz-xdebug.ini.disabled $dir/zz-xdebug.ini") | Out-Null
+            Write-Host "Xdebug ON (client port 9003)"
+        } else {
+            Invoke-InContainer -AsRoot @('sh', '-c', "rm -f $dir/zz-xdebug.ini") | Out-Null
+            Write-Host "Xdebug OFF"
+        }
+        Invoke-Compose @('restart', 'xenforo') | Out-Null
+    }
+
+    default { throw "Unknown command '$Command'. Run: .\xf.ps1 help" }
+}

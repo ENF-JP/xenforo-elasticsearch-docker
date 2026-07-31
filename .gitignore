@@ -1,0 +1,39 @@
+# ---------------------------------------------------------------------------
+# Secrets. Never commit.
+# ---------------------------------------------------------------------------
+# .env holds generated database and admin passwords. If you have already
+# committed it: rotate every secret in it, then purge it from history with
+# git-filter-repo - deleting it in a new commit leaves it readable in the old.
+.env
+stack/.env
+*.env
+!.env.example
+!stack/.env.example
+
+# ---------------------------------------------------------------------------
+# Licensed XenForo source. Must never be committed to a public repository.
+# ---------------------------------------------------------------------------
+# The working copy the container serves - 13,000+ disposable files, and it is
+# commercial licensed software.
+webroot/
+stack/webroot/
+xf-webroot/
+
+# ---------------------------------------------------------------------------
+# Local state
+# ---------------------------------------------------------------------------
+snapshots/
+*.sql
+*.sql.gz
+*.dump
+
+# ---------------------------------------------------------------------------
+# Editor / OS noise
+# ---------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+*~

@@ -1,0 +1,39 @@
+<?php
+
+// XenForo development configuration.
+//
+// The setup script copies this to <webroot>/src/config.php. Credentials are
+// read from the container environment, which docker compose populates from
+// .env — so nothing secret is written into this file and it is safe to commit.
+//
+// DEVELOPMENT SETTINGS. Do not carry this file to a public site: debug mode
+// exposes query counts, stack traces and the ACP development tools.
+
+$config['db']['host']     = getenv('XF_DB_HOST') ?: 'mariadb';
+$config['db']['port']     = '3306';
+$config['db']['username'] = getenv('XF_DB_USER') ?: 'xenforo';
+$config['db']['password'] = getenv('XF_DB_PASSWORD') ?: '';
+$config['db']['dbname']   = getenv('XF_DB_NAME') ?: 'xenforo';
+
+// Development mode:
+//   - PHP class changes take effect immediately (no cache clearing)
+//   - _output/ directories hold editable JSON/XML exports
+//   - extra developer tools appear in the Admin CP
+$config['debug']                  = true;
+$config['development']['enabled'] = true;
+
+// The add-on the ACP development tools default to. Set it with:
+//   xf defaultaddon Vendor/AddonId
+$config['development']['defaultAddOn'] = '';
+
+// No outbound mail from a dev box. Set to true only if you have started the
+// optional mailpit service (`--profile mail`) and pointed XenForo's SMTP at
+// host `mailpit`, port 1025.
+$config['enableMail'] = false;
+
+// Superadmin user IDs permitted to use the ACP development tools.
+$config['superAdmins'] = '1';
+
+// Log every query to internal_data/queries.log. Noisy and slow — uncomment
+// only while profiling.
+// $config['db']['slowQueryThreshold'] = 0;

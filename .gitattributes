@@ -1,0 +1,33 @@
+# Normalise line endings in the repository, and pin what each file needs on
+# checkout. Git for Windows sets core.autocrlf=true at SYSTEM level, so without
+# this file every text file is checked out CRLF - which breaks shell scripts
+# inside containers with the memorable error:
+#
+#   /usr/bin/env: 'bash\r': No such file or directory
+#
+# A local `git config` is not a substitute: it does not travel to CI or to
+# another clone. This file must be committed.
+
+* text=auto eol=lf
+
+# Must be LF - these run inside Linux containers or are parsed by Linux tools.
+*.sh            text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+*.php           text eol=lf
+Dockerfile      text eol=lf
+.env.example    text eol=lf
+*.json          text eol=lf
+*.md            text eol=lf
+
+# PowerShell runs on Windows; CRLF is correct and avoids editor churn.
+*.ps1           text eol=crlf
+*.psm1          text eol=crlf
+
+# Never touched.
+*.png           binary
+*.jpg           binary
+*.gif           binary
+*.ico           binary
+*.zip           binary
+*.gz            binary
