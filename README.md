@@ -2,8 +2,6 @@
 
 A reproducible local development environment for [XenForo](https://xenforo.com/) 2.3 add-on work: Apache + PHP, MariaDB, and Elasticsearch for [XenForo Enhanced Search](https://xenforo.com/purchase/) (XFES) — brought up with one command on **Linux, macOS or Windows**.
 
-It exists because static checks are not enough. An add-on can pass `php -l`, pass XML well-formedness, pass every unit test, and still fail to install on a real board — because `options.xml` used an attribute where XenForo reads a child element, or declared an array option without `sub_options`. Neither is catchable without a real install. This stack makes "install it on a clean board and click through the ACP" a 30-second step instead of an afternoon.
-
 ```bash
 git clone https://github.com/ENF-JP/xenforo-elasticsearch-docker
 cd xenforo-elasticsearch-docker
