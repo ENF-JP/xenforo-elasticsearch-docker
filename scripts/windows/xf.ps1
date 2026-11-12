@@ -145,11 +145,33 @@ function Invoke-InContainerWithInput {
     Push-Location $StackDir
     $prev = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
+    # The text must reach the container without a byte-order mark, or the
+    # first line arrives as EF BB BF + password and never matches the
+    # confirmation line. Which setting decides the bytes differs by version:
+    #   - Windows PowerShell 5.1 encodes a native command's stdin with
+    #     [Console]::InputEncoding, which is UTF-8 WITH a BOM when Windows'
+    #     "Use Unicode UTF-8 for worldwide language support" option is on.
+    #     It ignores $OutputEncoding here (verified on 5.1.26100).
+    #   - PowerShell 7 uses $OutputEncoding.
+    # Both are set BOM-free for this call. $OutputEncoding is a local
+    # assignment; the console encoding is process-wide, so it is restored.
+    # Setting it throws when no console is attached - then it is left alone.
+    $noBom = New-Object System.Text.UTF8Encoding($false)
+    $OutputEncoding = $noBom
+    $prevIn = $null
+    try { $prevIn = [Console]::InputEncoding; [Console]::InputEncoding = $noBom } catch { $prevIn = $null }
     try {
         $InputLines | & (Resolve-DockerBin) (@('compose', 'exec', '-T', '-u', 'www-data', 'xenforo') + $Cmd) | Out-Host
         return $LASTEXITCODE
     }
-    finally { $ErrorActionPreference = $prev; Pop-Location }
+    finally {
+        if ($null -ne $prevIn) {
+            try { [Console]::InputEncoding = $prevIn }
+            catch { Write-Verbose "Could not restore the console input encoding: $($_.Exception.Message)" }
+        }
+        $ErrorActionPreference = $prev
+        Pop-Location
+    }
 }
 
 function Get-DbClientCommand {
@@ -193,9 +215,21 @@ function Assert-SafeWebroot {
     if (-not (Test-Path (Join-Path $full 'src\XF.php'))) {
         throw "Refusing to delete ${full}: it does not contain src\XF.php, so it does not look like a XenForo webroot. Check XF_WEBROOT in stack\.env."
     }
+    # A junction or symlink is refused outright. Resolve-Path does not follow
+    # links, so a link to XF_SOURCE would pass the comparison below, and
+    # Windows PowerShell 5.1's Remove-Item -Recurse on a directory link
+    # deletes the TARGET's contents (PowerShell issue #621, fixed in 7).
+    if ((Get-Item -LiteralPath $full -Force).Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+        throw "Refusing to delete ${full}: it is a junction or symbolic link. Point XF_WEBROOT at a real directory."
+    }
     $src = Get-EnvValue 'XF_SOURCE'
-    if ($src -and (Test-Path $src -PathType Container) -and ((Resolve-Path $src).Path.TrimEnd('\') -eq $full)) {
-        throw "Refusing to delete ${full}: it is XF_SOURCE, your reference copy of XenForo."
+    if ($src -and (Test-Path $src -PathType Container)) {
+        $srcFull = (Resolve-Path $src).Path.TrimEnd('\')
+        # Equal, or one inside the other: deleting the webroot would take
+        # XF_SOURCE with it (or the webroot IS part of XF_SOURCE). -like is
+        # case-insensitive, matching Windows paths.
+        if ("$srcFull\" -like "$full\*") { throw "Refusing to delete ${full}: XF_SOURCE ($src) is inside it." }
+        if ("$full\" -like "$srcFull\*") { throw "Refusing to delete ${full}: it is inside XF_SOURCE ($src), your reference copy of XenForo." }
     }
 }
 
@@ -507,9 +541,13 @@ src\ and cmd.php, or the upload\ directory from a XenForo release zip:
             #
             # Windows PowerShell 5.1 does not escape a double quote inside a
             # native command's argument, so a " in the title or email would
-            # split it into extra xf:install arguments. Refuse it instead.
+            # split it into extra xf:install arguments. A trailing backslash
+            # does the same to an argument containing spaces: it turns the
+            # closing quote into \" and swallows the next argument. Refuse both.
             foreach ($pair in @(@('XF_BOARD_TITLE', $title), @('XF_ADMIN_EMAIL', $email), @('XF_ADMIN_USER', $adminUser))) {
-                if ($pair[1] -match '"') { throw "$($pair[0]) in stack\.env must not contain a double quote." }
+                if ($pair[1] -match '"' -or $pair[1] -match '\\$') {
+                    throw "$($pair[0]) in stack\.env must not contain a double quote or end with a backslash."
+                }
             }
             $installArgs = @('php', 'cmd.php', 'xf:install',
                 "--user=$adminUser",

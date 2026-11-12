@@ -169,9 +169,19 @@ assert_safe_webroot() {
         /|"$HOME"|"$HOME/"|"$STACK_DIR"|"$STACK_DIR/") die "Refusing to delete $w: XF_WEBROOT points at a directory that is not a webroot." ;;
     esac
     [[ -f "$w/src/XF.php" ]] || die "Refusing to delete $w: it does not contain src/XF.php, so it does not look like a XenForo webroot. Check XF_WEBROOT in stack/.env."
+    # Resolve symlinks on both sides, and fail CLOSED: if a directory cannot be
+    # entered, an empty result must stop the reset, not compare as "different".
+    local real_w real_src
+    real_w="$(cd "$w" 2>/dev/null && pwd -P)" || real_w=""
+    [[ -n "$real_w" ]] || die "Refusing to delete $w: cannot resolve its real path."
     src="$(env_get XF_SOURCE)"
-    if [[ -n "$src" && -d "$src" ]] && [[ "$(cd "$w" && pwd -P)" == "$(cd "$src" && pwd -P)" ]]; then
-        die "Refusing to delete $w: it is XF_SOURCE, your reference copy of XenForo."
+    if [[ -n "$src" && -d "$src" ]]; then
+        real_src="$(cd "$src" 2>/dev/null && pwd -P)" || real_src=""
+        [[ -n "$real_src" ]] || die "Refusing to delete $w: cannot resolve XF_SOURCE ($src) to compare with it."
+        # Equal, or one inside the other: deleting the webroot would take
+        # XF_SOURCE with it (or the webroot IS part of XF_SOURCE).
+        case "$real_src/" in "$real_w/"*) die "Refusing to delete $w: XF_SOURCE ($src) is inside it." ;; esac
+        case "$real_w/" in "$real_src/"*) die "Refusing to delete $w: it is inside XF_SOURCE ($src), your reference copy of XenForo." ;; esac
     fi
 }
 
@@ -519,6 +529,12 @@ doctor)
 
 errors)
     n="${1:-5}"
+    # Must be checked BEFORE the arithmetic below. Bash evaluates a variable's
+    # contents as an arithmetic expression, and array subscripts inside it
+    # undergo command substitution: `errors 'a[$(any command)]'` would run the
+    # command. This subcommand is on the documented agent allowlist, so that
+    # would be command execution without a prompt.
+    [[ "$n" =~ ^[0-9]{1,4}$ ]] || die "Usage: ./xf.sh errors [n]   (n = a number of entries, default 5)"
     LOG="$(webroot_path)/internal_data/error_log.php"
     [[ -f "$LOG" ]] || { echo "No error_log.php yet — nothing has errored."; exit 0; }
     # XenForo writes each entry as a PHP block; show the tail of the raw file.

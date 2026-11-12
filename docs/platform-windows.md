@@ -178,6 +178,17 @@ $t = [System.IO.File]::ReadAllText('.\scripts\windows\xf.ps1', [System.Text.UTF8
 [regex]::Matches($t, '[^\x00-\x7F]') | Group-Object Value | Select-Object Count, Name
 ```
 
+### Piping text into a native command can prepend a byte-order mark
+
+With Windows' "Use Unicode UTF-8 for worldwide language support" option on, Windows PowerShell 5.1 encodes what it pipes into a native command with `[Console]::InputEncoding` — UTF-8 *with* a BOM — and ignores `$OutputEncoding`:
+
+```powershell
+'abc' | docker compose exec -T xenforo od -c
+# 0000000 357 273 277   a   b   c  \r  \n      <- EF BB BF before the text
+```
+
+`setup` pipes the admin password into `xf:install` (so it never appears on a command line), and a BOM in front of the first copy made it never match the confirmation. `xf.ps1` sets a BOM-free encoding around that one call and restores the console encoding afterwards. Do the same if you pipe anything that must arrive byte-exact.
+
 ### No `&&`, no ternary, no `??` in PowerShell 5.1
 
 Those are PowerShell 7 features. `xf.ps1` targets 5.1 so it runs on a stock Windows install with nothing extra. Use `;` with `if ($?)`, and explicit `if`/`else`.

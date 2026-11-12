@@ -63,6 +63,12 @@ Set `HTTP_PORT=8080` in `.env` and use <http://localhost:8080>. Update the board
 
 Versions before v1.1.0 did not pass `--email`, `--title`, `--url` or `--skip-statistics` to `xf:install`, so the installer stopped to ask. With no keyboard attached (CI, an AI agent, a pipe) it aborted. Update the checkout. The values now come from `XF_ADMIN_EMAIL`, `XF_BOARD_TITLE` and `HTTP_PORT` in `.env`, and usage statistics are never switched on.
 
+### `setup` fails at "Re-enter the administrator user password" or after "warnings were found when verifying requirements"
+
+`setup` hands the admin password to `xf:install` on stdin, so it never appears on a command line. If XenForo's requirement check prints **warnings**, it first asks "Are you sure you want to continue?" — and that question reads the line meant for the password, so the install stops. Nothing is disclosed; it just fails. Fix what the warning names (it is printed just above), or run the install once by hand: `./xf.sh shell`, then `php cmd.php xf:install --user=admin --email=... --url=... --skip-statistics` and answer the prompts.
+
+On Windows, "Passwords did not match" on a version before v1.1's final build means PowerShell prefixed the piped text with a byte-order mark; see [platform-windows.md](platform-windows.md#piping-text-into-a-native-command-can-prepend-a-byte-order-mark).
+
 ### `doctor` warns that the Docker Engine is older than 28.3.3
 
 Upgrade the engine (or Docker Desktop). This is a security warning, not a compatibility one: older engines can let other machines on your network reach ports bound to `127.0.0.1`. See [SECURITY.md](SECURITY.md), Rule 1. Podman numbers its versions differently; there the warning means "check", not "broken".

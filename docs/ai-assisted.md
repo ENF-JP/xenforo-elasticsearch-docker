@@ -26,7 +26,7 @@ The right test isn't "could this break something?" — `addon install` certainly
 
 ## Claude Code
 
-Add to **`.claude/settings.json` in this repository's own root** — not a parent workspace — so the `/stack/.env` paths below are anchored to the right place. Three lists, and the order they are checked in matters: **deny first, then ask, then allow**. An allow rule can never override a deny, and an ask rule still prompts even when an allow rule also matches.
+Add to `.claude/settings.json` — in this repository, or in a parent workspace you open instead. Three lists, and the order they are checked in matters: **deny first, then ask, then allow**. An allow rule can never override a deny, and an ask rule still prompts even when an allow rule also matches.
 
 ```json
 {
@@ -57,8 +57,8 @@ Add to **`.claude/settings.json` in this repository's own root** — not a paren
       "Bash(docker compose down -v*)",
       "Bash(docker system prune*)",
       "Bash(docker compose exec xenforo php cmd.php xf-dev:export*)",
-      "Read(/stack/.env)",
-      "Edit(/stack/.env)"
+      "Read(**/stack/.env)",
+      "Edit(**/stack/.env)"
     ]
   }
 }
@@ -71,7 +71,7 @@ Notes on the rules:
 - **Trailing `*` after a space** is the form Claude Code itself writes when you click "don't ask again". The older `Bash(cmd:*)` form still works, but only at the very end of a pattern; prefer the space form.
 - **The deny list is the real control here, not the absence of an allow.** Without it, a rule you add later — or a "yes, don't ask again" clicked in a hurry — can re-admit `reset`. Deny rules from any settings file win over allow rules from any other.
 - **Raw `cmd.php` is allowed for one read-only command only.** A `cmd.php *` allow would admit `xf:addon-uninstall` and `xf-dev:export` — the second rewrites `_output/` from the database and destroys work that exists only on disk — so it is denied outright, and every other raw command asks.
-- **`Read(/stack/.env)` and `Edit(/stack/.env)`** keep the generated secrets out of the agent's file tools and stop it rewriting them. A leading `/` anchors the path to the project the settings file belongs to; `./stack/.env` would be relative to whatever directory the session started in, and would miss the file from a parent folder or a subfolder. Claude Code also applies these rules to `cat`, `head`, `sed` and similar commands it recognises in Bash. `creds` is denied for the same reason: it prints the admin password into the transcript.
+- **`Read(**/stack/.env)` and `Edit(**/stack/.env)`** keep the generated secrets out of the agent's file tools and stop it rewriting them. Paths in these rules are resolved from the directory the session starts in — `./stack/.env`, and even `/stack/.env` in a project settings file, mean "`stack/.env` directly under the starting directory". The `**/` prefix matches at any depth below it, so the rule still holds when the session starts in a parent workspace. It does not reach upwards: start the session at the repository root or above, not inside `scripts/`. Claude Code also applies these rules to `cat`, `head`, `tail`, `sed`, `tee` and redirections it recognises in Bash, but not to a script that opens the file itself. `creds` is denied for the same reason: it prints the admin password into the transcript.
 - **Deny rules are not a sandbox.** They match the commands Claude Code can recognise; they do not see inside `sh -c "..."`, a program called by a full path, or a script that opens files itself. If the restriction must hold against a determined agent, turn on Claude Code's sandbox as well.
 
 Deliberately absent from `allow`: any bare `xf.sh *` wildcard (it re-admits every destructive subcommand), and every network tool (see "Why `curl` is on the right" above).
