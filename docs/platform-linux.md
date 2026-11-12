@@ -6,7 +6,7 @@ The best-performing option of the three. Docker runs natively — no VM, no file
 
 ## 1. Install Docker Engine
 
-Use Docker's own repository, not your distribution's `docker.io` package, which is usually well behind and sometimes ships without Compose v2.
+Use Docker's own repository, not your distribution's `docker.io` package, which is usually well behind and sometimes ships without the Compose plugin.
 
 **Debian / Ubuntu**
 
@@ -32,12 +32,14 @@ sudo pacman -S docker docker-compose
 sudo systemctl enable --now docker
 ```
 
-Verify — Compose **v2** is required (`docker compose`, not `docker-compose`):
+Verify — Compose **v2 or later** is required (`docker compose`, not the old `docker-compose`; current releases are v5), and the engine must be **28.3.3 or later**:
 
 ```bash
-docker version
+docker version --format '{{.Server.Version}}'   # 28.3.3 or later
 docker compose version
 ```
+
+The engine version matters for security, not features. Before 28.0, another machine on your network could reach a port published on `127.0.0.1`; 28.2.0–28.3.2 reopened that after a firewalld reload (CVE-2025-54388). Fedora and RHEL use firewalld by default. See [SECURITY.md](SECURITY.md), Rule 1.
 
 ---
 

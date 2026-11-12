@@ -5,9 +5,11 @@
 # Usage:  ./xf.sh <command> [args]
 #         ./xf.sh help
 #
-# Feature-equivalent to scripts/windows/xf.ps1. Requires bash 4+ (macOS ships
-# bash 3.2, so install a newer one with `brew install bash`, or run this with
-# `bash ./xf.sh` after installing — the shebang picks up the newer one via env).
+# Feature-equivalent to scripts/windows/xf.ps1. Written to run on the bash 3.2
+# that macOS still ships as /bin/bash, as well as on bash 4 and 5. Avoid
+# bash-4-only features (associative arrays, ${var,,}, mapfile) and never expand
+# an array that may be empty while `set -u` is on: bash older than 4.4 treats
+# "${empty[@]}" as an unbound variable and exits.
 
 set -euo pipefail
 
@@ -25,10 +27,15 @@ command -v docker >/dev/null 2>&1 || die "docker not found on PATH. See docs/pla
 compose() { (cd "$STACK_DIR" && docker compose "$@"); }
 
 # Runs a command in the web container as www-data unless FIRST arg is --root.
+# Two explicit branches rather than an optional "-u www-data" array: an empty
+# array expansion aborts the script under `set -u` on bash < 4.4 (macOS).
 in_container() {
-    local user=(-u www-data)
-    if [[ "${1:-}" == "--root" ]]; then user=(); shift; fi
-    compose exec -T "${user[@]}" xenforo "$@"
+    if [[ "${1:-}" == "--root" ]]; then
+        shift
+        compose exec -T xenforo "$@"
+    else
+        compose exec -T -u www-data xenforo "$@"
+    fi
 }
 
 assert_running() {
@@ -71,6 +78,42 @@ assert_no_public_bind() {
     fi
 }
 
+# Minimum Docker Engine that keeps loopback-bound ports private. Engine 28.0
+# stopped other hosts on the same network from reaching ports published on
+# 127.0.0.1; 28.2.0-28.3.2 then reopened them after a firewalld reload
+# (CVE-2025-54388), fixed in 28.3.3. Rule 1 in docs/SECURITY.md depends on it.
+MIN_ENGINE=28.3.3
+
+# Succeeds if dotted version $1 >= $2. Pure bash so it works on macOS, where
+# `sort -V` is not guaranteed. Compares the first three numeric parts only.
+version_ge() {
+    local i a b
+    # read -a splits on the dots without globbing; it exists in bash 3.2.
+    IFS=. read -r -a a <<< "$1"
+    IFS=. read -r -a b <<< "$2"
+    for i in 0 1 2; do
+        if (( 10#${a[i]:-0} > 10#${b[i]:-0} )); then return 0; fi
+        if (( 10#${a[i]:-0} < 10#${b[i]:-0} )); then return 1; fi
+    done
+    return 0
+}
+
+# Warns, never fails: Podman and other engines report their own version
+# numbering, so a warning there is a prompt to check, not a verdict.
+check_engine_version() {
+    local v
+    v="$(docker version --format '{{.Server.Version}}' 2>/dev/null || true)"
+    # Strip suffixes such as "-rd" or "+dfsg1" before comparing.
+    v="${v%%-*}"; v="${v%%+*}"
+    if [[ ! "$v" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+        printf '%s  could not read the Docker Engine version (%s)%s\n' "$YEL" "${v:-none}" "$NC"
+    elif version_ge "$v" "$MIN_ENGINE"; then
+        echo "  ok      Docker Engine $v"
+    else
+        printf '%s  Docker Engine %s is older than %s. Older engines can expose ports bound to 127.0.0.1 to the local network. Upgrade - see docs/SECURITY.md (Rule 1).%s\n' "$RED" "$v" "$MIN_ENGINE" "$NC"
+    fi
+}
+
 webroot_path() {
     local rel; rel="$(env_get XF_WEBROOT)"; [[ -n "$rel" ]] || rel="./webroot"
     case "$rel" in
@@ -104,15 +147,16 @@ XenForo + Elasticsearch dev stack (Linux / macOS)
 
   XenForo
     cli <args...>         php cmd.php <args>   e.g.  cli xf:addon-list
-    addon install|upgrade|enable|disable|uninstall <Vendor/Id>
-    import <Vendor/Id>    xf-dev:import --addon=<Vendor/Id>
-    export <Vendor/Id>    xf-addon:export <Vendor/Id>
+    addon install|upgrade|rebuild|enable|disable|uninstall <Vendor/Id>
+                          (rebuild = re-import the add-on's _data/ XML)
+    import <Vendor/Id>    _output/ dev files -> database   (xf-dev:import)
+    export <Vendor/Id>    database -> _data/ XML           (xf-addon:export)
     rebuild               xf-dev:rebuild-caches
     reindex               xf-rebuild:search  (full Elasticsearch reindex)
     defaultaddon <V/Id>   Set development.defaultAddOn in config.php
 
   Diagnostics
-    doctor                Check ports, PHP extensions, DB, Elasticsearch, HTTP
+    doctor                Check engine, ports, PHP extensions, DB, Elasticsearch, HTTP
     errors [n]            Show the last n XenForo errors (default 5)
     log                   Tail the Apache error log
     shell                 Bash shell in the web container
@@ -158,7 +202,7 @@ XenForo is commercial software and is not distributed with this repo. Point
 XF_SOURCE at your own licensed copy — either an unpacked directory containing
 src/ and cmd.php, or a XenForo release zip:
 
-    XF_SOURCE=/home/you/xenforo_2.3.12/upload
+    XF_SOURCE=/home/you/xenforo_2.3.x/upload
 EOF
 )"
         [[ -e "$SRC" ]] || die "XF_SOURCE path does not exist: $SRC"
@@ -238,7 +282,19 @@ EOF
         fi
         echo
         echo "Installing XenForo..."
-        in_container php cmd.php xf:install "--user=$(env_get XF_ADMIN_USER)" "--password=$(env_get XF_ADMIN_PASSWORD)" --clear \
+        # Every value xf:install would otherwise ask for is passed explicitly,
+        # so setup runs unattended (CI, an AI agent, a script). Without them
+        # the installer stops to prompt, and with no input it aborts.
+        # --skip-statistics: never opt a dev board into sending usage
+        # statistics to XenForo. That prompt defaults to "yes", so accepting
+        # defaults non-interactively would have switched it on.
+        # --url: must include HTTP_PORT, or generated links point at port 80.
+        email="$(env_get XF_ADMIN_EMAIL)"; [[ -n "$email" ]] || email=admin@example.com
+        title="$(env_get XF_BOARD_TITLE)"; [[ -n "$title" ]] || title="XenForo Dev"
+        in_container php cmd.php xf:install \
+            "--user=$(env_get XF_ADMIN_USER)" "--password=$(env_get XF_ADMIN_PASSWORD)" \
+            "--email=$email" "--title=$title" "--url=$(board_url)" \
+            --skip-statistics --clear \
             || die "xf:install failed. Inspect with: ./xf.sh log"
     fi
 
@@ -258,7 +314,7 @@ reset)
     exec "$0" setup
 ;;
 
-up)      compose up -d; compose ps; assert_no_public_bind ;;
+up)      compose up -d; compose ps; assert_no_public_bind; check_engine_version ;;
 down)    compose down ;;
 restart) compose restart ;;
 build)   compose build ;;
@@ -268,10 +324,13 @@ cli)     assert_running; in_container php cmd.php "$@" ;;
 
 addon)
     assert_running
-    [[ $# -ge 2 ]] || die "Usage: ./xf.sh addon install|upgrade|enable|disable|uninstall <Vendor/Id>"
+    [[ $# -ge 2 ]] || die "Usage: ./xf.sh addon install|upgrade|rebuild|enable|disable|uninstall <Vendor/Id>"
     case "$1" in
         install)   xfcmd=xf:addon-install ;;
         upgrade)   xfcmd=xf:addon-upgrade ;;
+        # Re-imports the add-on's _data/ XML into the database without a
+        # version bump - what you need after editing _data/ by hand.
+        rebuild)   xfcmd=xf:addon-rebuild ;;
         enable)    xfcmd=xf:addon-enable ;;
         disable)   xfcmd=xf:addon-disable ;;
         uninstall) xfcmd=xf:addon-uninstall ;;
@@ -305,6 +364,10 @@ creds)
 ;;
 
 doctor)
+    echo "=== Docker Engine ==="
+    check_engine_version
+
+    echo
     echo "=== containers ==="
     compose ps
 
@@ -317,7 +380,10 @@ doctor)
     echo "=== PHP extensions XenForo 2.3 needs ==="
     have="$(compose exec -T xenforo php -m || true)"
     missing=0
-    for e in mysqli gd json pcre ctype iconv mbstring openssl SimpleXML filter hash session zip intl curl zlib; do
+    # XenForo's installer requires mysqli, gd, iconv, ctype, pcre, json, curl,
+    # mbstring, dom and SimpleXML. The rest are ones this image adds because
+    # add-ons and XenForo features commonly use them.
+    for e in mysqli gd json pcre ctype iconv mbstring openssl SimpleXML dom filter hash session zip intl curl zlib; do
         if printf '%s\n' "$have" | grep -qix "$e"; then
             printf '  ok      %s\n' "$e"
         else

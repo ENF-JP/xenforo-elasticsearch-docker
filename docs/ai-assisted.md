@@ -24,28 +24,48 @@ The right test isn't "could this break something?" — `addon install` certainly
 
 ## Claude Code
 
-Add to `.claude/settings.json` in your workspace:
+Add to `.claude/settings.json` in your workspace. Three lists, and the order they are checked in matters: **deny first, then ask, then allow** — an allow rule can never override a deny.
 
 ```json
 {
   "permissions": {
     "allow": [
-      "Bash(docker compose ps:*)",
-      "Bash(docker compose logs:*)",
-      "Bash(docker compose exec xenforo php cmd.php:*)",
+      "Bash(docker compose ps *)",
+      "Bash(docker compose logs *)",
+      "Bash(docker compose exec xenforo php cmd.php *)",
       "Bash(./scripts/linux/xf.sh doctor)",
       "Bash(./scripts/linux/xf.sh status)",
-      "Bash(./scripts/linux/xf.sh errors:*)",
-      "Bash(./scripts/linux/xf.sh es:*)",
-      "Bash(curl http://localhost:*)"
+      "Bash(./scripts/linux/xf.sh errors *)",
+      "Bash(./scripts/linux/xf.sh es *)",
+      "Bash(./scripts/linux/xf.sh addon install *)",
+      "Bash(./scripts/linux/xf.sh addon upgrade *)",
+      "Bash(curl http://localhost*)"
+    ],
+    "ask": [
+      "Bash(./scripts/linux/xf.sh addon uninstall *)"
+    ],
+    "deny": [
+      "Bash(./scripts/linux/xf.sh reset*)",
+      "Bash(./scripts/linux/xf.sh creds*)",
+      "Bash(docker compose down -v*)",
+      "Bash(docker system prune*)",
+      "Read(./stack/.env)",
+      "Edit(./stack/.env)"
     ]
   }
 }
 ```
 
-On Windows the equivalents are `PowerShell(.\scripts\windows\xf.ps1 doctor)` and so on.
+On Windows, Claude Code has a native PowerShell tool and its rules take the same shape: `PowerShell(.\scripts\windows\xf.ps1 doctor)`, `PowerShell(.\scripts\windows\xf.ps1 errors *)`, and so on. Mirror the deny list too — `PowerShell(.\scripts\windows\xf.ps1 reset*)` — because a `Bash(...)` deny does not cover a PowerShell call.
 
-Deliberately absent: `reset`, `down -v`, `uninstall`, and any bare `xf.sh:*` wildcard — a wildcard over the whole script re-admits every destructive subcommand you just excluded.
+Notes on the rules:
+
+- **Trailing `*` after a space** is the form Claude Code itself writes when you click "don't ask again". The older `Bash(cmd:*)` form still works, but only at the very end of a pattern; prefer the space form.
+- **The deny list is the real control here, not the absence of an allow.** Without it, a rule you add later — or a "yes, don't ask again" clicked in a hurry — can re-admit `reset`. Deny rules from any settings file win over allow rules from any other.
+- **`Read(./stack/.env)` and `Edit(./stack/.env)`** keep the generated secrets out of the agent's context and stop it rewriting them. `creds` is denied for the same reason: it prints the admin password into the transcript.
+- **Deny rules are not a sandbox.** They match the commands Claude Code can recognise; they do not see inside `sh -c "..."` or a script that opens files itself. If the restriction must hold against a determined agent, turn on Claude Code's sandbox as well.
+
+Deliberately absent from `allow`: any bare `xf.sh *` wildcard. A wildcard over the whole script re-admits every destructive subcommand.
 
 ---
 

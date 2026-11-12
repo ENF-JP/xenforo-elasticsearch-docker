@@ -132,8 +132,17 @@ function Get-FromContainer {
 }
 
 function Assert-Running {
-    $out = Get-ComposeOutput @('ps', '--services', '--filter', 'status=running')
-    if ($out -notmatch 'xenforo') {
+    <#
+      Throws unless the xenforo service is running.
+
+      The match is an exact per-line comparison. `$out -notmatch 'xenforo'`
+      looks equivalent but is not: on an array, -notmatch returns the
+      elements that do NOT match ('elasticsearch', 'mariadb'), which is a
+      non-empty, truthy array whenever the other services are up - so it
+      threw "not running" on a perfectly healthy stack.
+    #>
+    $out = @(Get-ComposeOutput @('ps', '--services', '--filter', 'status=running'))
+    if (-not ($out | Where-Object { "$_".Trim() -eq 'xenforo' })) {
         throw "The web container is not running. Start it with: .\xf.ps1 up"
     }
 }
@@ -163,6 +172,21 @@ function Set-EnvValue {
     [System.IO.File]::WriteAllText($EnvFile, (($lines -join "`n") + "`n"), (New-Object System.Text.UTF8Encoding($false)))
 }
 
+function Get-WebrootPath {
+    <#
+      Returns the full path of the webroot the container serves.
+
+      XF_WEBROOT may be relative (resolved from stack\, the default
+      ./webroot) or absolute. Join-Path alone would glue an absolute path
+      onto stack\ and produce a path that does not exist, so rooted paths
+      are returned as they are.
+    #>
+    $rel = Get-EnvValue 'XF_WEBROOT'
+    if (-not $rel) { $rel = './webroot' }
+    if ([System.IO.Path]::IsPathRooted($rel)) { return $rel }
+    return (Join-Path $StackDir ($rel -replace '^\./', ''))
+}
+
 function New-Secret {
     param([int] $Length = 32)
     # Alphanumeric only: '/', '+' and '=' from base64 need escaping in .env,
@@ -172,6 +196,33 @@ function New-Secret {
     $bytes = New-Object byte[] $Length
     $rng.GetBytes($bytes)
     -join ($bytes | ForEach-Object { [char]$chars[$_ % $chars.Count] })
+}
+
+# Minimum Docker Engine that keeps loopback-bound ports private. Engine 28.0
+# stopped other hosts on the same network from reaching ports published on
+# 127.0.0.1; 28.2.0-28.3.2 then reopened them after a firewalld reload
+# (CVE-2025-54388), fixed in 28.3.3. Rule 1 in docs/SECURITY.md depends on it.
+$script:MinEngine = [version]'28.3.3'
+
+function Test-EngineVersion {
+    <#
+      Prints whether the Docker Engine is new enough to keep 127.0.0.1-bound
+      ports private. Warns, never throws: Podman and other engines report
+      their own version numbering, so a warning there is a prompt to check.
+    #>
+    $raw = (Get-DockerOutput @('version', '--format', '{{.Server.Version}}')) -join ''
+    # Strip suffixes such as "-rd" or "+dfsg1" before parsing.
+    $clean = ($raw -split '[-+]')[0].Trim()
+    $v = $null
+    if (-not [version]::TryParse($clean, [ref] $v)) {
+        Write-Host "  could not read the Docker Engine version ($raw)" -ForegroundColor Yellow
+    }
+    elseif ($v -ge $script:MinEngine) {
+        Write-Host "  ok      Docker Engine $clean"
+    }
+    else {
+        Write-Host "  Docker Engine $clean is older than $($script:MinEngine). Older engines can expose ports bound to 127.0.0.1 to the local network. Upgrade - see docs/SECURITY.md (Rule 1)." -ForegroundColor Red
+    }
 }
 
 function Assert-NoPublicBind {
@@ -213,15 +264,16 @@ XenForo + Elasticsearch dev stack (Windows)
 
   XenForo
     cli <args...>         php cmd.php <args>   e.g.  cli xf:addon-list
-    addon install|upgrade|enable|disable|uninstall <Vendor/Id>
-    import <Vendor/Id>    xf-dev:import --addon=<Vendor/Id>
-    export <Vendor/Id>    xf-addon:export <Vendor/Id>
+    addon install|upgrade|rebuild|enable|disable|uninstall <Vendor/Id>
+                          (rebuild = re-import the add-on's _data/ XML)
+    import <Vendor/Id>    _output/ dev files -> database   (xf-dev:import)
+    export <Vendor/Id>    database -> _data/ XML           (xf-addon:export)
     rebuild               xf-dev:rebuild-caches
     reindex               xf-rebuild:search  (full Elasticsearch reindex)
     defaultaddon <V/Id>   Set development.defaultAddOn in config.php
 
   Diagnostics
-    doctor                Check ports, PHP extensions, DB, Elasticsearch, HTTP
+    doctor                Check engine, ports, PHP extensions, DB, Elasticsearch, HTTP
     errors [n]            Show the last n XenForo errors (default 5)
     log                   Tail the Apache error log
     shell                 Bash shell in the web container
@@ -251,9 +303,7 @@ XenForo + Elasticsearch dev stack (Windows)
         if (-not (Get-EnvValue 'XF_ADMIN_USER')) { Set-EnvValue 'XF_ADMIN_USER' 'admin' }
 
         # ---- webroot ----------------------------------------------------
-        $webrootRel = Get-EnvValue 'XF_WEBROOT'
-        if (-not $webrootRel) { $webrootRel = './webroot' }
-        $Webroot = Join-Path $StackDir ($webrootRel -replace '^\./', '')
+        $Webroot = Get-WebrootPath
 
         if (-not (Test-Path $Webroot)) {
             $source = Get-EnvValue 'XF_SOURCE'
@@ -265,7 +315,7 @@ XenForo is commercial software and is not distributed with this repo. Point
 XF_SOURCE at your own licensed copy - either an unpacked directory containing
 src\ and cmd.php, or the upload\ directory from a XenForo release zip:
 
-    XF_SOURCE=G:\sources\xenforo_2.3.12\upload
+    XF_SOURCE=G:\sources\xenforo_2.3.x\upload
 "@
             }
             if (-not (Test-Path $source)) { throw "XF_SOURCE path does not exist: $source" }
@@ -358,7 +408,23 @@ src\ and cmd.php, or the upload\ directory from a XenForo release zip:
             $adminUser = Get-EnvValue 'XF_ADMIN_USER'
             $adminPass = Get-EnvValue 'XF_ADMIN_PASSWORD'
             if (-not $adminPass) { throw "XF_ADMIN_PASSWORD is not set in .env" }
-            if ((Invoke-InContainer @('php', 'cmd.php', 'xf:install', "--user=$adminUser", "--password=$adminPass", '--clear')) -ne 0) {
+            $email = Get-EnvValue 'XF_ADMIN_EMAIL'; if (-not $email) { $email = 'admin@example.com' }
+            $title = Get-EnvValue 'XF_BOARD_TITLE'; if (-not $title) { $title = 'XenForo Dev' }
+            $iport = Get-EnvValue 'HTTP_PORT'; if (-not $iport) { $iport = '80' }
+            $iurl  = "http://localhost"; if ($iport -ne '80') { $iurl = "http://localhost:$iport" }
+            # Every value xf:install would otherwise ask for is passed
+            # explicitly, so setup runs unattended (CI, an AI agent, a script).
+            # Without them the installer stops to prompt, and with no input it
+            # aborts.
+            # --skip-statistics: never opt a dev board into sending usage
+            # statistics to XenForo. That prompt defaults to "yes", so
+            # accepting defaults non-interactively would have switched it on.
+            # --url: must include HTTP_PORT, or generated links point at port 80.
+            $installArgs = @('php', 'cmd.php', 'xf:install',
+                "--user=$adminUser", "--password=$adminPass",
+                "--email=$email", "--title=$title", "--url=$iurl",
+                '--skip-statistics', '--clear')
+            if ((Invoke-InContainer $installArgs) -ne 0) {
                 throw "xf:install failed. Inspect with: .\xf.ps1 log"
             }
         }
@@ -377,13 +443,12 @@ src\ and cmd.php, or the upload\ directory from a XenForo release zip:
         $c = Read-Host "Type RESET to confirm"
         if ($c -ne 'RESET') { Write-Host "Aborted."; break }
         Invoke-Compose @('down', '-v') | Out-Null
-        $webrootRel = Get-EnvValue 'XF_WEBROOT'; if (-not $webrootRel) { $webrootRel = './webroot' }
-        $Webroot = Join-Path $StackDir ($webrootRel -replace '^\./', '')
+        $Webroot = Get-WebrootPath
         if (Test-Path $Webroot) { Remove-Item $Webroot -Recurse -Force }
         & $PSCommandPath 'setup'
     }
 
-    'up'      { Invoke-Compose @('up', '-d') | Out-Null; Invoke-Compose @('ps') | Out-Null; Assert-NoPublicBind }
+    'up'      { Invoke-Compose @('up', '-d') | Out-Null; Invoke-Compose @('ps') | Out-Null; Assert-NoPublicBind; Test-EngineVersion }
     'down'    { Invoke-Compose @('down') | Out-Null }
     'restart' { Invoke-Compose @('restart') | Out-Null }
     'build'   { Invoke-Compose @('build') | Out-Null }
@@ -396,10 +461,13 @@ src\ and cmd.php, or the upload\ directory from a XenForo release zip:
 
     'addon' {
         Assert-Running
-        if ($Rest.Count -lt 2) { throw "Usage: .\xf.ps1 addon install|upgrade|enable|disable|uninstall <Vendor/Id>" }
+        if ($Rest.Count -lt 2) { throw "Usage: .\xf.ps1 addon install|upgrade|rebuild|enable|disable|uninstall <Vendor/Id>" }
         $action = $Rest[0]; $id = $Rest[1]
+        # rebuild re-imports the add-on's _data/ XML into the database without
+        # a version bump - what you need after editing _data/ by hand.
         $map = @{
             'install'   = 'xf:addon-install';   'upgrade' = 'xf:addon-upgrade'
+            'rebuild'   = 'xf:addon-rebuild'
             'enable'    = 'xf:addon-enable';    'disable' = 'xf:addon-disable'
             'uninstall' = 'xf:addon-uninstall'
         }
@@ -430,8 +498,7 @@ src\ and cmd.php, or the upload\ directory from a XenForo release zip:
 
     'defaultaddon' {
         if (-not $Rest) { throw "Usage: .\xf.ps1 defaultaddon <Vendor/Id>" }
-        $webrootRel = Get-EnvValue 'XF_WEBROOT'; if (-not $webrootRel) { $webrootRel = './webroot' }
-        $cfg = Join-Path (Join-Path $StackDir ($webrootRel -replace '^\./', '')) 'src\config.php'
+        $cfg = Join-Path (Get-WebrootPath) 'src\config.php'
         $txt = Get-Content $cfg -Raw
         $new = [regex]::Replace($txt, "(\`$config\['development'\]\['defaultAddOn'\]\s*=\s*')[^']*(')", "`${1}$($Rest[0])`${2}")
         [System.IO.File]::WriteAllText($cfg, $new)
@@ -447,7 +514,10 @@ src\ and cmd.php, or the upload\ directory from a XenForo release zip:
     }
 
     'doctor' {
-        Write-Host "=== containers ==="
+        Write-Host "=== Docker Engine ==="
+        Test-EngineVersion
+
+        Write-Host "`n=== containers ==="
         Invoke-Compose @('ps') | Out-Null
 
         Write-Host "`n=== port exposure ==="
@@ -459,7 +529,10 @@ src\ and cmd.php, or the upload\ directory from a XenForo release zip:
         # mangles double quotes inside a native command's arguments, so the -r
         # variant reaches PHP malformed and reports every extension missing.
         # -m needs no quoting at all.
-        $required = 'mysqli','gd','json','pcre','ctype','iconv','mbstring','openssl','SimpleXML','filter','hash','session','zip','intl','curl','zlib'
+        # XenForo's installer requires mysqli, gd, iconv, ctype, pcre, json,
+        # curl, mbstring, dom and SimpleXML. The rest are ones this image adds
+        # because add-ons and XenForo features commonly use them.
+        $required = 'mysqli','gd','json','pcre','ctype','iconv','mbstring','openssl','SimpleXML','dom','filter','hash','session','zip','intl','curl','zlib'
         $have = Get-FromContainer @('php', '-m')
         $missing = 0
         foreach ($e in $required) {
@@ -514,8 +587,7 @@ src\ and cmd.php, or the upload\ directory from a XenForo release zip:
     'errors' {
         $n = 5
         if ($Rest -and $Rest[0] -match '^\d+$') { $n = [int]$Rest[0] }
-        $webrootRel = Get-EnvValue 'XF_WEBROOT'; if (-not $webrootRel) { $webrootRel = './webroot' }
-        $logPath = Join-Path (Join-Path $StackDir ($webrootRel -replace '^\./', '')) 'internal_data\error_log.php'
+        $logPath = Join-Path (Get-WebrootPath) 'internal_data\error_log.php'
         if (-not (Test-Path $logPath)) { Write-Host "No error_log.php yet - nothing has errored."; break }
         # XenForo writes each entry as a PHP block; show the tail of the raw file.
         Get-Content $logPath -Tail ($n * 12)

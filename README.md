@@ -33,9 +33,9 @@ You supply your own licensed copy by setting `XF_SOURCE` in `stack/.env`:
 
 ```ini
 # an unpacked directory containing src/ and cmd.php ...
-XF_SOURCE=/home/you/xenforo_2.3.12/upload
+XF_SOURCE=/home/you/xenforo_2.3.x/upload
 # ... or a XenForo release zip
-XF_SOURCE=/home/you/Downloads/xenforo_2.3.12.zip
+XF_SOURCE=/home/you/Downloads/xenforo_2.3.x.zip
 ```
 
 The setup script copies it into a disposable working copy, so your reference download stays untouched.
@@ -48,18 +48,21 @@ The same applies to XenForo Enhanced Search: the Elasticsearch service here is t
 
 | Service | Image | Published? |
 |---|---|---|
-| `xenforo` | Apache + PHP 8.3 (built here) | `127.0.0.1:80` only |
-| `mariadb` | `mariadb:11.4` | **no** — reachable only inside the compose network |
-| `elasticsearch` | `elasticsearch:8.15.0` | **no** — and it must never be; see below |
-| `mailpit` *(optional)* | `axllent/mailpit` | `127.0.0.1:8025`, only with `--profile mail` |
+| `xenforo` | Apache + PHP 8.4 (built here; 8.2–8.5 selectable) | `127.0.0.1:80` only |
+| `mariadb` | `mariadb:11.4` (LTS; 11.8 / 12.3 selectable) | **no** — reachable only inside the compose network |
+| `elasticsearch` | `elasticsearch:8.19.25` | **no** — and it must never be; see below |
+| `mailpit` *(optional)* | `axllent/mailpit:v1.33.0` | `127.0.0.1:8025`, only with `--profile mail` |
+
+Every image is pinned to an explicit version in `stack/.env`. What changed between releases, and what to do on an existing stack, is in [CHANGELOG.md](CHANGELOG.md) and [docs/upgrading.md](docs/upgrading.md).
 
 Plus a helper script — `xf.sh` on Linux/macOS, `xf.ps1` on Windows — with identical commands on both:
 
 ```
 setup      Generate secrets, build, start, install XenForo
-doctor     Check ports, PHP extensions, DB, Elasticsearch, HTTP
-addon      install | upgrade | enable | disable | uninstall Vendor/AddonId
-import     _data XML -> database        export   database -> _output
+doctor     Check engine version, ports, PHP extensions, DB, Elasticsearch, HTTP
+addon      install | upgrade | rebuild | enable | disable | uninstall Vendor/AddonId
+import     _output dev files -> database
+export     database -> _data XML
 rebuild    Rebuild caches               reindex  Full Elasticsearch reindex
 errors     Last n XenForo errors        log      Tail the Apache log
 shell      Bash in the container        db       MariaDB client
@@ -68,7 +71,7 @@ creds      Show the generated admin login
 reset      Destroy everything and start over
 ```
 
-`doctor` is the one to run first whenever something looks wrong. It verifies every PHP extension XenForo 2.3 needs, confirms the database has tables, checks Elasticsearch cluster health and the document count of the `xf` index, hits the board over HTTP, and warns loudly if any container port has escaped to `0.0.0.0`.
+`doctor` is the one to run first whenever something looks wrong. It checks the Docker Engine is new enough to keep loopback-bound ports private, verifies every PHP extension XenForo 2.3 needs, confirms the database has tables, checks Elasticsearch cluster health and the document count of the `xf` index, hits the board over HTTP, and warns loudly if any container port has escaped to `0.0.0.0`.
 
 ---
 
@@ -84,6 +87,8 @@ reset      Destroy everything and start over
 | [docs/elasticsearch-xfes.md](docs/elasticsearch-xfes.md) | Wiring XFES to this stack, single-node "yellow" health, reindexing, and a measured explanation of why old content stops appearing in search |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | Symptom-first index of everything that has actually gone wrong |
 | [docs/ai-assisted.md](docs/ai-assisted.md) | Letting an AI coding agent drive the stack safely — allowlists, what it can verify unattended, what it must never be allowed to run |
+| [docs/upgrading.md](docs/upgrading.md) | Moving an existing stack to a new release: version changes, behaviour changes, and which ones are one-way |
+| [CHANGELOG.md](CHANGELOG.md) | Every change, per release |
 | [ROADMAP.md](ROADMAP.md) | Suggested additions, ranked, with the reasoning for each |
 
 ---
@@ -108,9 +113,10 @@ docs/                      see the table above
 
 ## Requirements
 
-- A container runtime with Compose v2: Docker Engine, Docker Desktop, Rancher Desktop, OrbStack or Colima
+- A container runtime with Compose v2 or later (current releases are v5): Docker Engine, Docker Desktop, Rancher Desktop, OrbStack or Colima
+- **Docker Engine 28.3.3 or later.** Older engines can let other machines on your network reach ports bound to `127.0.0.1` — see [docs/SECURITY.md](docs/SECURITY.md), Rule 1. `doctor` warns if yours is older.
 - ~4 GB RAM free for the VM (Elasticsearch alone takes 2 GB), ~6 GB disk
-- Your own licensed XenForo 2.3 files
+- Your own licensed XenForo 2.3 files (XenForo 2.3 itself accepts PHP 7.2+; the images here cover PHP 8.2–8.5)
 
 Per-platform install steps are in the platform documents above.
 

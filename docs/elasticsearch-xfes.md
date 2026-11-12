@@ -36,16 +36,31 @@ XFES requires **Elasticsearch 7.2.0 minimum**. Below that it refuses to connect.
 
 **OpenSearch is supported** and handled specially: when the server reports `version.distribution == 'opensearch'`, XFES pins its internal version to `7.10.2` regardless of the real number — because OpenSearch forked from ES 7.10.2 and its own 1.x/2.x/3.x numbering would fail the version comparison. Feature checks therefore behave as ES 7.10, never better.
 
-This stack pins **8.15.0**. To use OpenSearch instead:
+XFES sets a minimum and **no maximum**, so any newer release passes its version check.
+
+This stack pins **8.19.25** (`ES_VERSION` in `.env`). 8.19 is the final 8.x minor and the 8.x line that still receives fixes. It was 8.15.0 until v1.1.0; 8.15 no longer receives patches.
+
+### Elasticsearch 9.x
+
+9.x passes XFES's version check, but **has not been verified end to end with XFES on this stack** — indexing, the analyzer optimizer, similar threads. Passing a version check is not the same as working. If you try it:
+
+- Set `ES_VERSION` to a 9.x tag, then **delete the search volume and reindex from scratch**. An index written by 8.x can be read by 9.x, but you cannot go back: once 9.x has opened the data directory, 8.19 will refuse it.
+- Run the XFES setup wizard again, then `xf reindex`, then search for a known term.
+- Report what you find — an issue confirming or refuting 9.x is exactly the kind of platform report this repo needs.
+
+### OpenSearch instead
 
 ```yaml
 elasticsearch:
-  image: opensearchproject/opensearch:2.15.0
+  image: opensearchproject/opensearch:3.6.0
   environment:
     - discovery.type=single-node
     - DISABLE_SECURITY_PLUGIN=true          # same unpublished-port rule applies
+    - DISABLE_INSTALL_DEMO_CONFIG=true
     - OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g
 ```
+
+If `curl elasticsearch:9200` from the web container returns a TLS or authentication error, the environment variable did not take effect on your tag. Set `plugins.security.disabled: true` in a mounted `opensearch.yml` instead. Either way, the port stays unpublished.
 
 ---
 

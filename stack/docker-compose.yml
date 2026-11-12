@@ -22,6 +22,10 @@
 #      helper scripts generate with long random values.
 # ---------------------------------------------------------------------------
 
+# Compose project name. Volumes are namespaced by it, so changing it on an
+# existing stack makes the old database and index look like they vanished
+# (they are still there, under the old name). To run a second, independent
+# stack, set COMPOSE_PROJECT_NAME in that stack's .env; it overrides this line.
 name: xenforo-dev
 
 services:
@@ -30,14 +34,27 @@ services:
   # Database
   # ---------------------------------------------------------------------
   mariadb:
-    image: mariadb:11.4
+    # 11.4 is an LTS release supported to 2029. 11.8 and 12.3 are newer LTS
+    # lines; set MARIADB_VERSION to match what your production host runs.
+    # Moving an EXISTING data volume to a newer major is a one-way upgrade -
+    # see docs/upgrading.md.
+    image: mariadb:${MARIADB_VERSION:-11.4}
     container_name: ${COMPOSE_PREFIX:-xf}-mariadb
     restart: unless-stopped
+    # Nothing in this stack needs to gain privileges through setuid binaries
+    # after start-up. Blocks a class of privilege escalation inside the
+    # container at no cost.
+    security_opt: ["no-new-privileges:true"]
     environment:
       MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD:?set it in .env — run the setup script to generate one}
       MARIADB_DATABASE: ${MARIADB_DATABASE:-xenforo}
       MARIADB_USER: ${MARIADB_USER:-xenforo}
       MARIADB_PASSWORD: ${MARIADB_PASSWORD:?set it in .env — run the setup script to generate one}
+      # When MARIADB_VERSION is raised on an existing volume, run
+      # mariadb-upgrade on first start (after backing up the system tables)
+      # instead of serving a data directory whose system tables are stale.
+      # Does nothing when the version is unchanged.
+      MARIADB_AUTO_UPGRADE: "1"
     command:
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_general_ci
@@ -67,9 +84,14 @@ services:
   # a strictly worse exposure than an open database. Query it from inside the
   # web container instead — the helper scripts' `es` command does exactly that.
   elasticsearch:
-    image: docker.elastic.co/elasticsearch/elasticsearch:${ES_VERSION:-8.15.0}
+    # 8.19 is the final 8.x line and the one still receiving fixes. 9.x also
+    # passes XFES's version check (it sets a 7.2.0 minimum and no maximum),
+    # but has not been verified end to end with XFES here - see
+    # docs/elasticsearch-xfes.md before switching.
+    image: docker.elastic.co/elasticsearch/elasticsearch:${ES_VERSION:-8.19.25}
     container_name: ${COMPOSE_PREFIX:-xf}-elasticsearch
     restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
     environment:
       - discovery.type=single-node
       - xpack.security.enabled=false
@@ -85,10 +107,9 @@ services:
       # Refuse wildcard deletes (DELETE /_all, DELETE /*).
       - action.destructive_requires_name=true
     mem_limit: ${ES_MEM_LIMIT:-2g}
+    # No memlock ulimit: it only has an effect together with
+    # bootstrap.memory_lock=true, which a dev node does not need.
     ulimits:
-      memlock:
-        soft: -1
-        hard: -1
       nofile:
         soft: 65536
         hard: 65536
@@ -113,7 +134,7 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        PHP_VERSION: ${PHP_VERSION:-8.3}
+        PHP_VERSION: ${PHP_VERSION:-8.4}
         PHP_TIMEZONE: ${PHP_TIMEZONE:-UTC}
         # Linux only: align the container's www-data with your host user so a
         # bind-mounted webroot is writable from both sides. The Linux setup
@@ -121,9 +142,12 @@ services:
         # and macOS, where Docker Desktop translates ownership for you.
         PUID: ${PUID:-33}
         PGID: ${PGID:-33}
-    image: xenforo-dev-php:${PHP_VERSION:-8.3}-${PUID:-33}
+    image: xenforo-dev-php:${PHP_VERSION:-8.4}-${PUID:-33}
     container_name: ${COMPOSE_PREFIX:-xf}-web
     restart: unless-stopped
+    # Apache starts as root and switches to www-data itself, which this
+    # setting still allows; it only blocks gaining privileges via setuid files.
+    security_opt: ["no-new-privileges:true"]
     depends_on:
       mariadb:
         condition: service_healthy
@@ -168,9 +192,13 @@ services:
   # enableMail = true, point XenForo's SMTP at host `mailpit` port 1025, and
   # read the messages at http://localhost:8025.
   mailpit:
-    image: axllent/mailpit:latest
+    # Pinned like everything else. Mailpit had several 2026 security releases;
+    # most affected instances with SMTP exposed to a network, which this one
+    # is not (SMTP is reachable only inside the compose network).
+    image: axllent/mailpit:${MAILPIT_VERSION:-v1.33.0}
     container_name: ${COMPOSE_PREFIX:-xf}-mailpit
     restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
     profiles: ["mail"]
     ports:
       - "127.0.0.1:${MAILPIT_PORT:-8025}:8025"

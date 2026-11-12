@@ -1,0 +1,15 @@
+# Dependabot keeps the GitHub Actions pins in .github/workflows current.
+#
+# It deliberately does NOT cover the container images or the PECL extensions:
+# their versions live in stack/.env.example variables (${ES_VERSION:-...}) and
+# in Dockerfile ARGs used inside FROM, which Dependabot cannot read. Those are
+# covered by the monthly pin-review issue (.github/workflows/pin-review.yml),
+# reviewed by a person, never auto-merged - an unattended Elasticsearch major
+# bump can break XenForo Enhanced Search without any error at startup.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5

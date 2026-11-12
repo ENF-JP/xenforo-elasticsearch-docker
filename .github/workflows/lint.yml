@@ -1,0 +1,134 @@
+# Static checks for the helper scripts, the Dockerfile and the compose file.
+#
+# Runs on every push to main and every pull request. Needs no XenForo source
+# and no secrets: it lints and parses, it never builds the stack or installs
+# XenForo (XenForo is licensed software and is not available to CI here).
+#
+# Tool versions are pinned so a run is reproducible; actions are pinned to a
+# commit SHA because a tag can be moved after the fact. Dependabot proposes
+# updates to the action pins.
+name: lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Read-only token. Nothing here writes to the repository.
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    name: xf.sh (shellcheck, bash 3.2 parse)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: shellcheck
+        run: docker run --rm -v "$PWD:/m:ro" koalaman/shellcheck:v0.11.0 /m/scripts/linux/xf.sh
+      # macOS still ships bash 3.2 as /bin/bash. A construct that only newer
+      # bash accepts would be a hard failure for every Mac user.
+      - name: parse under bash 3.2.57
+        run: docker run --rm -v "$PWD:/m:ro" bash:3.2.57 bash -n /m/scripts/linux/xf.sh
+
+  dockerfile:
+    name: Dockerfile (hadolint)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: hadolint
+        run: docker run --rm -i hadolint/hadolint:v2.15.1-debian hadolint - < stack/Dockerfile
+
+  compose:
+    name: compose file (valid, loopback-only)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The compose file refuses to resolve without these (the :? guards), so
+      # CI supplies throwaway placeholders. They never reach a running service.
+      - name: placeholder .env
+        run: |
+          printf '%s\n' MARIADB_ROOT_PASSWORD=ci-placeholder MARIADB_PASSWORD=ci-placeholder > stack/.env
+      - name: resolve, including the optional mail profile
+        working-directory: stack
+        run: docker compose --profile mail config --format json > "$RUNNER_TEMP/resolved.json"
+      # The rule the whole repository is built around: every published port
+      # carries an explicit 127.0.0.1, and the database and search node publish
+      # nothing at all. A bare "3306:3306" resolves with no host_ip at all,
+      # which Docker treats as every interface; this check rejects it.
+      - name: every published port is loopback-only
+        run: |
+          python3 - "$RUNNER_TEMP/resolved.json" <<'EOF'
+          import json, sys
+          cfg = json.load(open(sys.argv[1]))
+          bad = []
+          for name, svc in cfg["services"].items():
+              ports = svc.get("ports", [])
+              if name in ("mariadb", "elasticsearch") and ports:
+                  bad.append(f"{name}: must not publish any port, found {ports}")
+              for p in ports:
+                  if p.get("host_ip") != "127.0.0.1":
+                      bad.append(f"{name}: port {p.get('target')} host_ip={p.get('host_ip')!r}, expected '127.0.0.1'")
+          if bad:
+              print("\n".join(bad))
+              sys.exit(1)
+          print("ok: all published ports are bound to 127.0.0.1")
+          EOF
+
+  powershell:
+    name: xf.ps1 (PS 5.1 parse, ASCII, PSScriptAnalyzer)
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Windows PowerShell 5.1 is the target, and its parser is stricter than
+      # PowerShell 7's in places (no &&, no ternary, no ??).
+      - name: parse under Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $errs = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path scripts\windows\xf.ps1).Path, [ref]$null, [ref]$errs)
+          if ($errs) { $errs | ForEach-Object { Write-Output $_.ToString() }; exit 1 }
+          Write-Output "ok: parses under $($PSVersionTable.PSVersion)"
+      # PowerShell 5.1 reads a BOM-less .ps1 as Windows-1252, and some UTF-8
+      # sequences then decode to smart quotes that end strings early.
+      - name: xf.ps1 is pure ASCII
+        shell: powershell
+        run: |
+          $t = [System.IO.File]::ReadAllText((Resolve-Path scripts\windows\xf.ps1).Path)
+          $m = [regex]::Matches($t, '[^\x00-\x7F]')
+          if ($m.Count) { Write-Output "non-ASCII characters: $($m.Count)"; exit 1 }
+          Write-Output "ok: ASCII only"
+      - name: PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module PSScriptAnalyzer -RequiredVersion 1.25.0 -Scope CurrentUser -Force
+          $r = Invoke-ScriptAnalyzer -Path scripts/windows/xf.ps1 -Settings scripts/windows/PSScriptAnalyzerSettings.psd1
+          $r | Format-Table -AutoSize RuleName, Severity, Line, Message | Out-String -Width 200
+          if ($r) { exit 1 }
+
+  line-endings:
+    name: line endings
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # A CRLF shell script fails inside a container with
+      # "/usr/bin/env: 'bash\r': No such file or directory". Everything is
+      # stored LF in the index; .gitattributes decides what each file gets on
+      # checkout.
+      - name: index is LF throughout
+        run: |
+          if git ls-files --eol | grep -E '^i/(crlf|mixed)'; then
+            echo "files above are stored with CRLF in the index"; exit 1
+          fi
+          echo "ok"

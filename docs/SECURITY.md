@@ -8,7 +8,7 @@ This document is not theoretical. Every rule in it is here because something wen
 
 ## The incident this repo is built around
 
-An earlier version of this environment published MariaDB with:
+The test environment this repo is derived from was purposely exposed to the open internet. It was configured the way development stacks very often end up by accident, and it published MariaDB with:
 
 ```yaml
 ports:
@@ -19,13 +19,13 @@ and credentials `root`/`root`, `xenforo`/`password`.
 
 **Roughly 76 minutes later** an automated scanner had found it, dropped the `xenforo` database, and created a `RECOVER_YOUR_DATA` table demanding payment.
 
-Three things made it possible, and all three are common:
+Three things made it possible. None of them is exotic — they are exactly what an *accidentally* exposed stack looks like, which is why the result applies to every stack that copies them:
 
 1. **A bare `host:container` mapping means `0.0.0.0`** — every interface, including the one facing the internet. Not localhost. Docker's own words for this default are easy to miss.
-2. **Docker installs its own NAT/iptables rules**, which on Linux bypass most `ufw`/`firewalld` configurations, and on Windows do not necessarily hit a Windows Firewall prompt. "My firewall blocks 3306" was believed, and was false.
+2. **Docker installs its own NAT/iptables rules**, which on Linux bypass most `ufw`/`firewalld` configurations, and on Windows do not necessarily hit a Windows Firewall prompt. "My firewall blocks 3306" is a common belief, and it is false.
 3. **Default credentials** turned discovery into compromise instantly. Scanning for open 3306 and trying `root/root` is a fully automated, continuous, internet-wide activity.
 
-Nothing of value was lost — the database was a blank install minutes old, and the webroot and add-on source were verified byte-identical afterwards. That was luck, not resilience.
+Nothing of value was lost — the database was a blank install minutes old, and the webroot and add-on source were verified byte-identical afterwards. That was because the environment held nothing worth taking, not because anything defended it. A real development stack configured the same way would have lost real data.
 
 > **"It's only a dev box" is not a mitigation.** It was compromised in under two hours.
 
@@ -47,6 +47,8 @@ ports:
   docker compose config | grep -A1 host_ip
   ```
 - Keep the automated check. Both helper scripts run `Assert-NoPublicBind` / `assert_no_public_bind` on `up` and `doctor`, which scans `docker ps` for `0.0.0.0:` and `[::]:` and warns in red.
+
+- **Run Docker Engine 28.3.3 or later.** The `127.0.0.1:` prefix is only as good as the engine enforcing it. Before Engine 28.0, a machine on the same network segment could route packets straight to a loopback-bound published port on Linux; 28.0 closed that. Engines 28.2.0 to 28.3.2 then reopened it after any firewalld reload ([CVE-2025-54388](https://nvd.nist.gov/vuln/detail/cve-2025-54388)), fixed in 28.3.3. Check with `docker version --format '{{.Server.Version}}'`; `xf doctor` and `xf up` warn if it is older.
 
 **Don't:**
 - Don't assume a host firewall protects you. On Linux, Docker's `DOCKER` iptables chain is consulted before the `INPUT` chain where `ufw` rules live — a published port is reachable even with `ufw` set to deny.
@@ -91,7 +93,7 @@ This is *strictly worse* than the exposed MariaDB above, because there is not ev
 - Don't add `ports: - "9200:9200"` to use Kibana, Cerebro, Dejavu or any browser tool. Attach that tool to the compose network as another service instead:
   ```yaml
   kibana:
-    image: docker.elastic.co/kibana/kibana:8.15.0
+    image: docker.elastic.co/kibana/kibana:8.19.25   # match ES_VERSION exactly
     environment: [ELASTICSEARCH_HOSTS=http://elasticsearch:9200]
     ports: ["127.0.0.1:5601:5601"]     # the UI may be published; ES still must not be
   ```
@@ -173,9 +175,10 @@ The image and config here deliberately enable things that are dangerous in produ
 ## Rule 7 — Keep images current, and pin them deliberately
 
 **Do:**
-- Pin image versions (`mariadb:11.4`, `elasticsearch:8.15.0`) so builds are reproducible and an upstream change cannot silently alter the stack.
+- Pin image versions (`mariadb:11.4`, `elasticsearch:8.19.25`, `axllent/mailpit:v1.33.0`, and the PECL extensions in the Dockerfile) so builds are reproducible and an upstream change cannot silently alter the stack. Every pin lives in `stack/.env` or the Dockerfile's `ARG` lines.
+- Let the repository tell you when a pin is stale: a scheduled workflow opens a **pin-review issue** on the 1st of each month listing every pinned version, for a person to compare with upstream. Nothing updates itself — an Elasticsearch major bump in particular can break XFES without any error at startup, and a database or search-index upgrade cannot be undone once the volume has been opened by the newer version.
 - Refresh those pins on a schedule and rebuild: `docker compose pull && docker compose build --pull`.
-- Scan occasionally: `docker scout cves xenforo-dev-php:8.3`, or `trivy image <image>`.
+- Scan occasionally: `docker scout cves xenforo-dev-php:8.4-33`, or `trivy image <image>`.
 
 **Don't:**
 - Don't use `:latest` for infrastructure images. "It worked yesterday" stops being debuggable.
@@ -187,10 +190,11 @@ The image and config here deliberately enable things that are dangerous in produ
 
 **Do:**
 - Prefer rootless Docker or Podman on Linux if the host matters. See [platform-linux.md](platform-linux.md).
-- Keep `no-new-privileges` in mind for services that don't need to escalate:
+- Keep `no-new-privileges` on every service. All four ship with it; keep it on any service you add:
   ```yaml
   security_opt: ["no-new-privileges:true"]
   ```
+  It blocks gaining privileges through setuid binaries after start-up. Apache and the MariaDB entrypoint still drop from root to their service user normally.
 - Remember that anyone in the `docker` group on Linux effectively has root on the host — `docker run -v /:/host` is trivially a full takeover. Adding a user to `docker` is granting root.
 
 **Don't:**
@@ -256,14 +260,17 @@ stat -c '%a %n' stack/.env 2>/dev/null
 
 # 5. Images are current
 docker compose pull --dry-run 2>/dev/null || docker compose pull
+
+# 6. The engine enforces loopback binding (28.3.3 or later)
+docker version --format '{{.Server.Version}}'
 ```
 
-The helper scripts fold checks 1 and 2 into `xf doctor`.
+The helper scripts fold checks 1, 2 and 6 into `xf doctor`.
 
 ---
 
 ## Reporting a problem with this repository
 
-If you find a security defect in these scripts or compose definitions, please open an issue — or, if you consider it sensitive, use GitHub's private vulnerability reporting on the repository.
+If you find a security defect in these scripts or compose definitions, please report it privately through GitHub's private vulnerability reporting: the repository's **Security** tab → **Report a vulnerability**. Use an ordinary issue only for problems that are not exploitable.
 
 This repository contains no XenForo source and no credentials. If you believe you have found either committed here, please report it immediately; it would be a mistake, and it will be purged from history rather than merely deleted.

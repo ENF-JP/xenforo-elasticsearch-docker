@@ -38,7 +38,7 @@ Puts `docker` on `PATH` automatically, which is also what lets an AI agent drive
 
 <https://rancherdesktop.io/> — free, no employee/revenue threshold.
 
-During setup choose **dockerd (moby)** as the container engine, not containerd, so the `docker` CLI and Compose v2 work as documented here. `xf.ps1` already probes Rancher's install paths if `docker` isn't on `PATH`.
+During setup choose **dockerd (moby)** as the container engine, not containerd, so the `docker` CLI and Compose work as documented here. `xf.ps1` already probes Rancher's install paths if `docker` isn't on `PATH`.
 
 ### Either way
 
@@ -49,8 +49,8 @@ Enable the **WSL2 backend**, and in Settings → Resources give the VM at least 
 ## 3. Verify in a *new* terminal
 
 ```powershell
-docker version
-docker compose version
+docker version --format '{{.Server.Version}}'   # 28.3.3 or later
+docker compose version                           # v2 or later; current releases are v5
 ```
 
 PATH changes do not reach shells that were already open. "docker is not recognized" immediately after installing is almost always this, not a broken install — `xf.ps1` prints exactly that hint when it can't find `docker.exe`, and probes the standard install locations before giving up.
@@ -72,8 +72,8 @@ notepad stack\.env          # set XF_SOURCE to your licensed XenForo files
 `XF_SOURCE` accepts a Windows path to either an unpacked webroot or a release zip:
 
 ```ini
-XF_SOURCE=G:\sources\xenforo_2.3.12\upload
-XF_SOURCE=C:\Users\you\Downloads\xenforo_2.3.12.zip
+XF_SOURCE=G:\sources\xenforo_2.3.x\upload
+XF_SOURCE=C:\Users\you\Downloads\xenforo_2.3.x.zip
 ```
 
 Then:
@@ -106,14 +106,22 @@ A bind mount from `C:\` or `G:\` into a Linux container crosses the 9p/virtiofs 
 
 Steady-state browsing is fine, because opcache (`validate_timestamps=1`, `revalidate_freq=0`) keeps the parse cost down while still picking up edits immediately.
 
-If rebuilds become annoying, move the webroot **inside** the WSL2 filesystem, where I/O is native:
+If rebuilds become annoying, run the whole stack from **inside** the WSL2 filesystem, where I/O is native:
 
-```powershell
-# In .env — a WSL path, reachable from Windows as \\wsl$\...
-XF_WEBROOT=\\wsl$\docker-desktop-data\xf-webroot
+```bash
+# in your own WSL distribution (for example Ubuntu: wsl --install -d Ubuntu)
+cd ~
+git clone https://github.com/ENF-JP/xenforo-elasticsearch-docker
+cd xenforo-elasticsearch-docker
+cp stack/.env.example stack/.env      # XF_SOURCE=/mnt/g/sources/xenforo_2.3.x/upload works
+./scripts/linux/xf.sh setup
 ```
 
-You trade direct Windows access to the files (Explorer, your editor's file watcher) for a large speed-up. A middle path many prefer: keep the webroot on Windows, but do the heavy CLI work from inside WSL using `scripts/linux/xf.sh` against the same Docker daemon.
+Turn on that distribution under Docker Desktop → Settings → Resources → WSL integration so `docker` works inside it. Windows still reaches the files as `\\wsl.localhost\Ubuntu\home\<you>\...`, so your editor works, though file watchers across that boundary can be slow.
+
+> **Earlier versions of this page suggested `XF_WEBROOT=\\wsl$\docker-desktop-data\...`.** That distribution no longer exists in current Docker Desktop (it was folded into a single `docker-desktop` distribution from 4.30), and a Windows-side UNC path is not a reliable bind-mount source anyway. Clone into your own distribution instead, as above.
+
+`XF_WEBROOT` accepts an absolute Windows path (`D:\xf\webroot`) as well as a relative one. Before v1.1.0, `xf.ps1` mishandled absolute paths.
 
 ---
 
