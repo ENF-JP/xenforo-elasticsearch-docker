@@ -174,6 +174,10 @@ assert_safe_webroot() {
     local real_w real_src
     real_w="$(cd "$w" 2>/dev/null && pwd -P)" || real_w=""
     [[ -n "$real_w" ]] || die "Refusing to delete $w: cannot resolve its real path."
+    # A symlinked webroot is refused, as on Windows: the prompt would show the
+    # link's name, but `rm -rf link/` (with a trailing slash) deletes the
+    # target's contents - a tree the user never saw named.
+    [[ ! -L "${w%/}" ]] || die "Refusing to delete $w: it is a symbolic link (to $real_w). Point XF_WEBROOT at a real directory."
     src="$(env_get XF_SOURCE)"
     if [[ -n "$src" && -d "$src" ]]; then
         real_src="$(cd "$src" 2>/dev/null && pwd -P)" || real_src=""
@@ -236,7 +240,7 @@ XenForo + Elasticsearch dev stack (Linux / macOS)
     errors [n]            Show the last n XenForo errors (default 5)
     log                   Tail the Apache error log
     shell                 Bash shell in the web container
-    db                    MariaDB client
+    db ["SQL"]            MariaDB client, or run one query
     es [path]             Query Elasticsearch  (default: _cat/indices?v)
     xdebug on|off         Toggle Xdebug (off is roughly twice as fast)
     creds                 Show the ACP URL and admin credentials
@@ -518,7 +522,10 @@ doctor)
 
     echo
     echo "=== HTTP ==="
-    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$(board_url)/" || true)"
+    # -L: XenForo answers "/" with a 301 to index.php, so without following
+    # redirects a healthy board reports 301 - shown in red as a failure. A
+    # few hops are plenty; xf.ps1's Invoke-WebRequest follows them too.
+    code="$(curl -s -L --max-redirs 3 -o /dev/null -w '%{http_code}' --max-time 15 "$(board_url)/" || true)"
     if [[ "$code" == "200" ]]; then echo "  $(board_url) -> $code"
     else printf '%s  %s -> %s%s\n' "$RED" "$(board_url)" "${code:-no response}" "$NC"; fi
 
@@ -538,14 +545,18 @@ errors)
     LOG="$(webroot_path)/internal_data/error_log.php"
     [[ -f "$LOG" ]] || { echo "No error_log.php yet — nothing has errored."; exit 0; }
     # XenForo writes each entry as a PHP block; show the tail of the raw file.
-    tail -n "$((n * 12))" "$LOG"
+    # 10# forces base 10, so a value such as 08 is not rejected as bad octal.
+    tail -n "$((10#$n * 12))" "$LOG"
 ;;
 
 log)   compose logs --tail 80 -f xenforo ;;
 shell) assert_running; compose exec -u www-data xenforo bash ;;
 
-# Extra arguments go to the client, so `./xf.sh db -e "SELECT ..."` runs one query.
-db)      db_client --tty "$@" ;;
+# `./xf.sh db "SELECT ..."` runs one query (same form as xf.ps1); arguments
+# starting with "-" go to the client unchanged, so `db -e "..."` works too.
+db)
+    if [[ $# -gt 0 && "$1" != -* ]]; then db_client --tty -e "$*"; else db_client --tty "$@"; fi
+;;
 
 es)
     # Queried through the web container because Elasticsearch has no published

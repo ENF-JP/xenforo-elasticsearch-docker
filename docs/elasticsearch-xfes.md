@@ -145,7 +145,7 @@ docker compose exec xenforo curl -s "http://elasticsearch:9200/xf/_count" \
   -H 'Content-Type: application/json' -d '{"query":{"match":{"message":"<term>"}}}'
 
 # Did indexing silently fail for some content?
-./xf.sh db -e "SELECT COUNT(*) FROM xf_es_index_failed;"
+./xf.sh db "SELECT COUNT(*) FROM xf_es_index_failed"
 
 # Is the index read-only? ES flips to this at the 95% disk flood stage and every
 # subsequent index request fails. (This stack disables the threshold, but a

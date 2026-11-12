@@ -208,29 +208,71 @@ function Assert-SafeWebroot {
       drive root) would otherwise be deleted without further question.
     #>
     param([Parameter(Mandatory)][string] $Path)
-    if (-not (Test-Path $Path)) { return }
-    $full = (Resolve-Path $Path).Path.TrimEnd('\')
+    # -LiteralPath and plain string comparisons throughout: [ ] ? * are legal
+    # in Windows folder names, and the wildcard-aware forms would treat them
+    # as patterns - making a comparison miss, or matching sibling folders.
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    $full = (Resolve-Path -LiteralPath $Path).ProviderPath.TrimEnd('\')
     $forbidden = @([System.IO.Path]::GetPathRoot($full).TrimEnd('\'), $env:USERPROFILE.TrimEnd('\'), $StackDir.TrimEnd('\'))
-    if ($forbidden -contains $full) { throw "Refusing to delete ${full}: XF_WEBROOT points at a directory that is not a webroot." }
-    if (-not (Test-Path (Join-Path $full 'src\XF.php'))) {
+    foreach ($f in $forbidden) {
+        if ([string]::Equals($full, $f, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Refusing to delete ${full}: XF_WEBROOT points at a directory that is not a webroot."
+        }
+    }
+    if (-not (Test-Path -LiteralPath ([System.IO.Path]::Combine($full, 'src', 'XF.php')))) {
         throw "Refusing to delete ${full}: it does not contain src\XF.php, so it does not look like a XenForo webroot. Check XF_WEBROOT in stack\.env."
     }
     # A junction or symlink is refused outright. Resolve-Path does not follow
-    # links, so a link to XF_SOURCE would pass the comparison below, and
-    # Windows PowerShell 5.1's Remove-Item -Recurse on a directory link
-    # deletes the TARGET's contents (PowerShell issue #621, fixed in 7).
+    # links, so a link to XF_SOURCE would pass the comparison below. (Links
+    # INSIDE the webroot are handled by Remove-DirectoryTree.)
     if ((Get-Item -LiteralPath $full -Force).Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
         throw "Refusing to delete ${full}: it is a junction or symbolic link. Point XF_WEBROOT at a real directory."
     }
     $src = Get-EnvValue 'XF_SOURCE'
-    if ($src -and (Test-Path $src -PathType Container)) {
-        $srcFull = (Resolve-Path $src).Path.TrimEnd('\')
+    if ($src -and (Test-Path -LiteralPath $src -PathType Container)) {
+        $srcFull = (Resolve-Path -LiteralPath $src).ProviderPath.TrimEnd('\')
         # Equal, or one inside the other: deleting the webroot would take
-        # XF_SOURCE with it (or the webroot IS part of XF_SOURCE). -like is
-        # case-insensitive, matching Windows paths.
-        if ("$srcFull\" -like "$full\*") { throw "Refusing to delete ${full}: XF_SOURCE ($src) is inside it." }
-        if ("$full\" -like "$srcFull\*") { throw "Refusing to delete ${full}: it is inside XF_SOURCE ($src), your reference copy of XenForo." }
+        # XF_SOURCE with it (or the webroot IS part of XF_SOURCE). Ordinal,
+        # case-insensitive prefix tests with a trailing separator, so
+        # D:\xf is not mistaken for a parent of D:\xf2.
+        $ic = [System.StringComparison]::OrdinalIgnoreCase
+        if ("$srcFull\".StartsWith("$full\", $ic)) { throw "Refusing to delete ${full}: XF_SOURCE ($src) is inside it." }
+        if ("$full\".StartsWith("$srcFull\", $ic)) { throw "Refusing to delete ${full}: it is inside XF_SOURCE ($src), your reference copy of XenForo." }
     }
+}
+
+function Remove-DirectoryTree {
+    <#
+      Deletes a directory tree WITHOUT following junctions or symbolic links
+      inside it. A link is removed as a link; whatever it points to is left
+      alone.
+
+      Why not Remove-Item -Recurse: on some Windows PowerShell 5.1 builds it
+      follows a directory junction and deletes the target's contents
+      (PowerShell issue #621). A webroot can legitimately contain one - an
+      add-on folder linked in from the developer's working repository - and
+      `reset` must not empty that repository. [IO.Directory]::Delete with
+      recursion refuses ("access denied") on a junction instead.
+    #>
+    param([Parameter(Mandatory)][string] $Path)
+    $attrs = [System.IO.File]::GetAttributes($Path)
+    if ($attrs -band [System.IO.FileAttributes]::ReparsePoint) {
+        # Non-recursive delete of a link removes the link only.
+        [System.IO.Directory]::Delete($Path)
+        return
+    }
+    foreach ($entry in [System.IO.Directory]::GetFileSystemEntries($Path)) {
+        $a = [System.IO.File]::GetAttributes($entry)
+        if ($a -band [System.IO.FileAttributes]::Directory) {
+            Remove-DirectoryTree -Path $entry
+        }
+        else {
+            # Clear read-only so the delete is not refused.
+            [System.IO.File]::SetAttributes($entry, [System.IO.FileAttributes]::Normal)
+            [System.IO.File]::Delete($entry)
+        }
+    }
+    [System.IO.Directory]::Delete($Path)
 }
 
 function Assert-Running {
@@ -389,7 +431,7 @@ XenForo + Elasticsearch dev stack (Windows)
     errors [n]            Show the last n XenForo errors (default 5)
     log                   Tail the Apache error log
     shell                 Bash shell in the web container
-    db                    MariaDB client
+    db ['SQL']            MariaDB client, or run one query
     es [path]             Query Elasticsearch  (default: _cat/indices?v)
     xdebug on|off         Toggle Xdebug (off is roughly twice as fast)
     creds                 Show the ACP URL and admin credentials
@@ -576,7 +618,7 @@ src\ and cmd.php, or the upload\ directory from a XenForo release zip:
         $c = Read-Host "Type RESET to confirm"
         if ($c -ne 'RESET') { Write-Host "Aborted."; break }
         Invoke-Compose @('down', '-v') | Out-Null
-        if (Test-Path $Webroot) { Remove-Item $Webroot -Recurse -Force }
+        if (Test-Path -LiteralPath $Webroot) { Remove-DirectoryTree -Path ((Resolve-Path -LiteralPath $Webroot).ProviderPath) }
         & $PSCommandPath 'setup'
     }
 
@@ -738,8 +780,13 @@ src\ and cmd.php, or the upload\ directory from a XenForo release zip:
         # Password via MYSQL_PWD for the length of the session; see Get-DbClientCommand.
         $had = Test-Path Env:MYSQL_PWD; $old = $env:MYSQL_PWD
         $env:MYSQL_PWD = Get-EnvValue 'MARIADB_PASSWORD'
-        # Extra arguments go to the client: .\xf.ps1 db -e 'SELECT ...' runs one query.
-        try { Invoke-DockerInteractive (@('compose', '--project-directory', $StackDir) + (Get-DbClientCommand -Interactive) + @($Rest | Where-Object { $_ })) }
+        # .\xf.ps1 db 'SELECT ...' runs one query. A bare -e cannot be used
+        # here: this script takes PowerShell's common parameters, and -e is
+        # read as an ambiguous abbreviation of -ErrorAction / -ErrorVariable.
+        # So a first argument that is not an option is treated as the query.
+        $extra = @($Rest | Where-Object { $_ })
+        if ($extra.Count -and -not $extra[0].StartsWith('-')) { $extra = @('-e', ($extra -join ' ')) }
+        try { Invoke-DockerInteractive (@('compose', '--project-directory', $StackDir) + (Get-DbClientCommand -Interactive) + $extra) }
         finally { if ($had) { $env:MYSQL_PWD = $old } else { Remove-Item Env:MYSQL_PWD -ErrorAction SilentlyContinue } }
     }
 

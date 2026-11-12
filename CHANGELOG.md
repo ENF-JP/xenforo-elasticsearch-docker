@@ -82,7 +82,10 @@ Found by this release's security review and fixed before release. Most were alre
 - **`xf.ps1` refuses a double quote, or a trailing backslash,** in `XF_BOARD_TITLE`, `XF_ADMIN_EMAIL` or `XF_ADMIN_USER`. Windows PowerShell 5.1 would split either into extra installer arguments.
 - **Mailpit pinned to v1.33.1** instead of v1.33.0; v1.33.1 limits the remote stylesheets its HTML check fetches.
 - On Windows the admin password is piped with an encoding that has no byte-order mark. With Windows' "Use Unicode UTF-8 for worldwide language support" option on, Windows PowerShell 5.1 otherwise prefixes the first piped line with `EF BB BF`, so the password and its confirmation never match. Found in this release's end-to-end test.
-- `xf db` now passes extra arguments to the client, so the documented `./xf.sh db -e "SELECT ..."` runs the query instead of opening a prompt.
+- **`xf db "SELECT ..."` runs one query** in both scripts (`./xf.sh db -e "..."` works too). Before, extra arguments were ignored and a prompt opened, so the `db -e` command documented in `elasticsearch-xfes.md` never worked. On Windows the query is the first argument: a bare `-e` is read by PowerShell as an abbreviation of its own `-ErrorAction`.
+- **`xf.sh doctor` reported a healthy board as a red failure** (`-> 301`). XenForo answers `/` with a redirect to `index.php`, and the check did not follow it. It now follows up to three redirects, as `xf.ps1` already did.
+- **`reset` on Windows no longer follows junctions inside the webroot** — an add-on folder linked in from your working repository is unlinked, not emptied. Paths with `[` `]` in them are compared literally.
+- **`xf.sh errors 08`** no longer fails as an invalid octal number.
 
 ### Documentation
 
