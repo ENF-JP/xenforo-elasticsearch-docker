@@ -23,7 +23,7 @@ not redistributed here:
                                  (8.2, 8.3 and 8.5 selectable)
   * mariadb:11.4               - GPL v2 (11.8 and 12.3 selectable)
   * elasticsearch:8.19.25      - Elastic License 2.0 / SSPL / AGPL (see Elastic)
-  * axllent/mailpit:v1.33.0    - MIT (optional service, not started by default)
+  * axllent/mailpit:v1.33.1    - MIT (optional service, not started by default)
 
 The image also installs the APCu and Xdebug PHP extensions from PECL at build
 time (PHP License and Xdebug License respectively); they are not

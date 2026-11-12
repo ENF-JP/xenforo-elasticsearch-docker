@@ -131,6 +131,74 @@ function Get-FromContainer {
     return (Get-ComposeOutput (@('exec', '-T', 'xenforo') + $Cmd))
 }
 
+function Invoke-InContainerWithInput {
+    <#
+      Runs a command in the web container as www-data, feeding InputLines to
+      its stdin, and returns only the exit code.
+
+      Used to hand a secret to a command that would otherwise need it as an
+      argument. Command-line arguments are visible to every local user
+      (`ps` on Linux and macOS, process listings on Windows) - including the
+      arguments of processes inside a container. Stdin is not.
+    #>
+    param([Parameter(Mandatory)][string[]] $InputLines, [Parameter(Mandatory)][string[]] $Cmd)
+    Push-Location $StackDir
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $InputLines | & (Resolve-DockerBin) (@('compose', 'exec', '-T', '-u', 'www-data', 'xenforo') + $Cmd) | Out-Host
+        return $LASTEXITCODE
+    }
+    finally { $ErrorActionPreference = $prev; Pop-Location }
+}
+
+function Get-DbClientCommand {
+    <#
+      Returns the `compose exec` arguments that start the MariaDB client in
+      the mariadb container. The password is not among them: the callers put
+      it in the MYSQL_PWD environment variable of this process for the length
+      of the call, and `-e MYSQL_PWD` (a name, no value) copies it into the
+      container. Environment variables are readable only by the process owner
+      and administrators; command-line arguments are readable by every user.
+    #>
+    param([switch] $Interactive)
+    $u = Get-EnvValue 'MARIADB_USER'; if (-not $u) { $u = 'xenforo' }
+    $n = Get-EnvValue 'MARIADB_DATABASE'; if (-not $n) { $n = 'xenforo' }
+    $a = @('exec')
+    if (-not $Interactive) { $a += '-T' }
+    return ($a + @('-e', 'MYSQL_PWD', 'mariadb', 'mariadb', "-u$u", $n))
+}
+
+function Get-DbOutput {
+    <# Runs one MariaDB client call (e.g. -e 'SHOW TABLES') and returns its output lines. #>
+    param([Parameter(Mandatory)][string[]] $SqlArgs)
+    $had = Test-Path Env:MYSQL_PWD; $old = $env:MYSQL_PWD
+    $env:MYSQL_PWD = Get-EnvValue 'MARIADB_PASSWORD'
+    try { return (Get-ComposeOutput ((Get-DbClientCommand) + $SqlArgs)) }
+    finally { if ($had) { $env:MYSQL_PWD = $old } else { Remove-Item Env:MYSQL_PWD -ErrorAction SilentlyContinue } }
+}
+
+function Assert-SafeWebroot {
+    <#
+      Throws unless the path is a disposable XenForo webroot that `reset` may
+      delete. XF_WEBROOT can be any path, and `reset` removes it recursively,
+      so a mistaken value (the pristine XF_SOURCE copy, a profile folder, a
+      drive root) would otherwise be deleted without further question.
+    #>
+    param([Parameter(Mandatory)][string] $Path)
+    if (-not (Test-Path $Path)) { return }
+    $full = (Resolve-Path $Path).Path.TrimEnd('\')
+    $forbidden = @([System.IO.Path]::GetPathRoot($full).TrimEnd('\'), $env:USERPROFILE.TrimEnd('\'), $StackDir.TrimEnd('\'))
+    if ($forbidden -contains $full) { throw "Refusing to delete ${full}: XF_WEBROOT points at a directory that is not a webroot." }
+    if (-not (Test-Path (Join-Path $full 'src\XF.php'))) {
+        throw "Refusing to delete ${full}: it does not contain src\XF.php, so it does not look like a XenForo webroot. Check XF_WEBROOT in stack\.env."
+    }
+    $src = Get-EnvValue 'XF_SOURCE'
+    if ($src -and (Test-Path $src -PathType Container) -and ((Resolve-Path $src).Path.TrimEnd('\') -eq $full)) {
+        throw "Refusing to delete ${full}: it is XF_SOURCE, your reference copy of XenForo."
+    }
+}
+
 function Assert-Running {
     <#
       Throws unless the xenforo service is running.
@@ -227,19 +295,29 @@ function Test-EngineVersion {
 
 function Assert-NoPublicBind {
     <#
-      Refuses to stay quiet if a container port is bound to all interfaces.
+      Refuses to stay quiet if a container port is published beyond loopback.
       The stack this is derived from was compromised in ~76 minutes because of
       a bare "3306:3306". See docs/SECURITY.md.
+
+      Docker lists ports as "127.0.0.1:80->80/tcp, 9200/tcp": entries with
+      "->" are published, the rest are only exposed inside the network. For
+      each published entry the address before ":<port>->" must be 127.0.0.1
+      or [::1]. That catches 0.0.0.0 and [::] (all interfaces) and also a
+      specific LAN address, which is just as reachable from the network.
     #>
     $rows = Get-DockerOutput @('ps', '--format', '{{.Names}}|{{.Ports}}')
     $bad = @()
     foreach ($r in $rows) {
         if (-not $r) { continue }
         $name, $ports = $r -split '\|', 2
-        if ($ports -match '0\.0\.0\.0:|\[::\]:') { $bad += "$name -> $ports" }
+        foreach ($entry in ($ports -split ',\s*')) {
+            if ($entry -match '^(.+?):\d+(-\d+)?->' -and $Matches[1] -ne '127.0.0.1' -and $Matches[1] -ne '[::1]') {
+                $bad += "$name -> $ports"; break
+            }
+        }
     }
     if ($bad.Count) {
-        Write-Host "WARNING: container ports are published on ALL interfaces:" -ForegroundColor Red
+        Write-Host "WARNING: container ports are published beyond loopback:" -ForegroundColor Red
         $bad | ForEach-Object { Write-Host "    $_" -ForegroundColor Red }
         Write-Host "  Bind them to 127.0.0.1 in docker-compose.yml, then: .\xf.ps1 down; .\xf.ps1 up" -ForegroundColor Red
         Write-Host "  Read docs/SECURITY.md before continuing." -ForegroundColor Red
@@ -355,6 +433,11 @@ src\ and cmd.php, or the upload\ directory from a XenForo release zip:
         }
 
         # ---- build and start --------------------------------------------
+        # Before anything is published: an engine below the minimum can expose
+        # the 127.0.0.1 ports to the local network.
+        Write-Host ""
+        Test-EngineVersion
+
         Write-Host "`nBuilding image (first build takes a few minutes)..."
         if ((Invoke-Compose @('build')) -ne 0) { throw "Image build failed." }
 
@@ -382,10 +465,7 @@ src\ and cmd.php, or the upload\ directory from a XenForo release zip:
         # XenForo then refuses to install. Decide from the DATABASE whether this
         # is a fresh install - never from the lock file alone, or re-running
         # setup could wipe a working install.
-        $dbUser = Get-EnvValue 'MARIADB_USER'; if (-not $dbUser) { $dbUser = 'xenforo' }
-        $dbName = Get-EnvValue 'MARIADB_DATABASE'; if (-not $dbName) { $dbName = 'xenforo' }
-        $dbPass = Get-EnvValue 'MARIADB_PASSWORD'
-        $tables = Get-ComposeOutput @('exec', '-T', 'mariadb', 'mariadb', "-u$dbUser", "-p$dbPass", $dbName, '-e', 'SHOW TABLES')
+        $tables = Get-DbOutput @('-e', 'SHOW TABLES')
         $tableCount = @($tables | Where-Object { $_ -and $_ -notmatch '^Tables_in_' }).Count
 
         if ($tableCount -gt 0) {
@@ -420,13 +500,25 @@ src\ and cmd.php, or the upload\ directory from a XenForo release zip:
             # statistics to XenForo. That prompt defaults to "yes", so
             # accepting defaults non-interactively would have switched it on.
             # --url: must include HTTP_PORT, or generated links point at port 80.
+            # The password is NOT passed as --password: command-line arguments
+            # are visible to every local user, inside the container too. With
+            # no --password, xf:install reads it from stdin twice (entry and
+            # confirmation); with no terminal attached it reads plain lines.
+            #
+            # Windows PowerShell 5.1 does not escape a double quote inside a
+            # native command's argument, so a " in the title or email would
+            # split it into extra xf:install arguments. Refuse it instead.
+            foreach ($pair in @(@('XF_BOARD_TITLE', $title), @('XF_ADMIN_EMAIL', $email), @('XF_ADMIN_USER', $adminUser))) {
+                if ($pair[1] -match '"') { throw "$($pair[0]) in stack\.env must not contain a double quote." }
+            }
             $installArgs = @('php', 'cmd.php', 'xf:install',
-                "--user=$adminUser", "--password=$adminPass",
+                "--user=$adminUser",
                 "--email=$email", "--title=$title", "--url=$iurl",
                 '--skip-statistics', '--clear')
-            if ((Invoke-InContainer $installArgs) -ne 0) {
+            if ((Invoke-InContainerWithInput -InputLines @($adminPass, $adminPass) -Cmd $installArgs) -ne 0) {
                 throw "xf:install failed. Inspect with: .\xf.ps1 log"
             }
+            $adminPass = $null
         }
 
         Assert-NoPublicBind
@@ -439,16 +531,20 @@ src\ and cmd.php, or the upload\ directory from a XenForo release zip:
     }
 
     'reset' {
-        Write-Host "This destroys the containers, all volumes (database AND search index), and the webroot." -ForegroundColor Yellow
+        $Webroot = Get-WebrootPath
+        Assert-SafeWebroot $Webroot
+        Write-Host "This destroys the containers, all volumes (database AND search index), and the webroot:" -ForegroundColor Yellow
+        Write-Host "    $Webroot" -ForegroundColor Yellow
         $c = Read-Host "Type RESET to confirm"
         if ($c -ne 'RESET') { Write-Host "Aborted."; break }
         Invoke-Compose @('down', '-v') | Out-Null
-        $Webroot = Get-WebrootPath
         if (Test-Path $Webroot) { Remove-Item $Webroot -Recurse -Force }
         & $PSCommandPath 'setup'
     }
 
-    'up'      { Invoke-Compose @('up', '-d') | Out-Null; Invoke-Compose @('ps') | Out-Null; Assert-NoPublicBind; Test-EngineVersion }
+    # The engine check runs before `up -d`, so the warning comes before any
+    # port is published.
+    'up'      { Test-EngineVersion; Invoke-Compose @('up', '-d') | Out-Null; Invoke-Compose @('ps') | Out-Null; Assert-NoPublicBind }
     'down'    { Invoke-Compose @('down') | Out-Null }
     'restart' { Invoke-Compose @('restart') | Out-Null }
     'build'   { Invoke-Compose @('build') | Out-Null }
@@ -498,6 +594,12 @@ src\ and cmd.php, or the upload\ directory from a XenForo release zip:
 
     'defaultaddon' {
         if (-not $Rest) { throw "Usage: .\xf.ps1 defaultaddon <Vendor/Id>" }
+        # The id is written into a PHP string in config.php, through a regex
+        # replacement. An id shape keeps a quote from ending the PHP string and
+        # keeps $ (special in the replacement) out of it.
+        if ($Rest[0] -notmatch '^[A-Za-z][A-Za-z0-9_]*(/[A-Za-z][A-Za-z0-9_]*)?$') {
+            throw "Not an add-on id: '$($Rest[0])'. Expected Vendor/AddonId (letters, digits, underscore)."
+        }
         $cfg = Join-Path (Get-WebrootPath) 'src\config.php'
         $txt = Get-Content $cfg -Raw
         $new = [regex]::Replace($txt, "(\`$config\['development'\]\['defaultAddOn'\]\s*=\s*')[^']*(')", "`${1}$($Rest[0])`${2}")
@@ -547,10 +649,8 @@ src\ and cmd.php, or the upload\ directory from a XenForo release zip:
         Write-Host "`n=== database ==="
         # SHOW TABLES, not a SELECT with a quoted table_schema - same PowerShell
         # 5.1 quoting problem as above.
-        $dbUser = Get-EnvValue 'MARIADB_USER'; if (-not $dbUser) { $dbUser = 'xenforo' }
         $dbName = Get-EnvValue 'MARIADB_DATABASE'; if (-not $dbName) { $dbName = 'xenforo' }
-        $dbPass = Get-EnvValue 'MARIADB_PASSWORD'
-        $tbl = Get-ComposeOutput @('exec', '-T', 'mariadb', 'mariadb', "-u$dbUser", "-p$dbPass", $dbName, '-e', 'SHOW TABLES')
+        $tbl = Get-DbOutput @('-e', 'SHOW TABLES')
         $count = @($tbl | Where-Object { $_ -and $_ -notmatch '^Tables_in_' }).Count
         if ($count -gt 0) { Write-Host "  ok      $count tables in '$dbName'" }
         else { Write-Host "  no tables found - has XenForo been installed?" -ForegroundColor Red }
@@ -597,9 +697,12 @@ src\ and cmd.php, or the upload\ directory from a XenForo release zip:
     'shell' { Assert-Running; Invoke-DockerInteractive @('compose', '--project-directory', $StackDir, 'exec', '-u', 'www-data', 'xenforo', 'bash') }
 
     'db' {
-        $dbUser = Get-EnvValue 'MARIADB_USER'; if (-not $dbUser) { $dbUser = 'xenforo' }
-        $dbName = Get-EnvValue 'MARIADB_DATABASE'; if (-not $dbName) { $dbName = 'xenforo' }
-        Invoke-DockerInteractive @('compose', '--project-directory', $StackDir, 'exec', 'mariadb', 'mariadb', "-u$dbUser", "-p$(Get-EnvValue 'MARIADB_PASSWORD')", $dbName)
+        # Password via MYSQL_PWD for the length of the session; see Get-DbClientCommand.
+        $had = Test-Path Env:MYSQL_PWD; $old = $env:MYSQL_PWD
+        $env:MYSQL_PWD = Get-EnvValue 'MARIADB_PASSWORD'
+        # Extra arguments go to the client: .\xf.ps1 db -e 'SELECT ...' runs one query.
+        try { Invoke-DockerInteractive (@('compose', '--project-directory', $StackDir) + (Get-DbClientCommand -Interactive) + @($Rest | Where-Object { $_ })) }
+        finally { if ($had) { $env:MYSQL_PWD = $old } else { Remove-Item Env:MYSQL_PWD -ErrorAction SilentlyContinue } }
     }
 
     'es' {

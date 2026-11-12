@@ -223,5 +223,6 @@ xf setup
 Take a database dump first if there's anything in it you want:
 
 ```bash
-docker compose exec -T mariadb mariadb-dump -uxenforo -p"$PASS" xenforo > backup.sql
+# from stack/; variables expand inside the container, password via MYSQL_PWD
+docker compose exec -T mariadb sh -c 'MYSQL_PWD="$MARIADB_PASSWORD" mariadb-dump -u"$MARIADB_USER" "$MARIADB_DATABASE"' > backup.sql
 ```

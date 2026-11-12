@@ -50,15 +50,24 @@ env_get() {
     sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*\(.*\)$/\1/p" "$ENV_FILE" | head -n1 | sed 's/[[:space:]]*$//'
 }
 
+# Sets KEY=VALUE in .env, replacing an existing line or appending one.
+#
+# .env holds the generated secrets, so it is kept at mode 0600. The rewrite
+# goes through a temp file, and a freshly created file gets the user's default
+# mode (usually 0644 - readable by every local account), which `mv` would then
+# put in place of the original. So the temp file is created under umask 077,
+# before anything is written into it, and the result is chmod-ed again.
 env_set() {
-    local key="$1" val="$2"
+    local key="$1" val="$2" tmp
     if grep -qE "^[[:space:]]*${key}[[:space:]]*=" "$ENV_FILE"; then
+        tmp="$(umask 077 && mktemp "$ENV_FILE.XXXXXX")"
         # -i differs between GNU and BSD/macOS sed, so write via a temp file.
-        sed "s|^[[:space:]]*${key}[[:space:]]*=.*|${key}=${val}|" "$ENV_FILE" > "$ENV_FILE.tmp"
-        mv "$ENV_FILE.tmp" "$ENV_FILE"
+        sed "s|^[[:space:]]*${key}[[:space:]]*=.*|${key}=${val}|" "$ENV_FILE" > "$tmp"
+        mv "$tmp" "$ENV_FILE"
     else
         printf '%s=%s\n' "$key" "$val" >> "$ENV_FILE"
     fi
+    chmod 600 "$ENV_FILE"
 }
 
 gen_secret() {
@@ -67,11 +76,24 @@ gen_secret() {
     LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c "${1:-32}"
 }
 
+# Warns about any container port published on an address other than loopback.
+# Docker lists ports as "127.0.0.1:80->80/tcp, 9200/tcp": entries with "->"
+# are published, the rest are only exposed inside the network. For each
+# published entry the address before ":<port>->" must be 127.0.0.1 or [::1].
+# That catches 0.0.0.0 and [::] (all interfaces) and also a specific LAN
+# address, which is just as reachable from the network.
 assert_no_public_bind() {
     local bad
-    bad="$(docker ps --format '{{.Names}}|{{.Ports}}' | grep -E '0\.0\.0\.0:|\[::\]:' || true)"
+    bad="$(docker ps --format '{{.Names}}|{{.Ports}}' | awk -F'|' '{
+        n = split($2, parts, ", ")
+        for (i = 1; i <= n; i++) {
+            if (parts[i] !~ /->/) continue
+            addr = parts[i]; sub(/:[0-9]+(-[0-9]+)?->.*/, "", addr)
+            if (addr != "127.0.0.1" && addr != "[::1]") { print; next }
+        }
+    }' || true)"
     if [[ -n "$bad" ]]; then
-        printf '%sWARNING: container ports are published on ALL interfaces:%s\n' "$RED" "$NC" >&2
+        printf '%sWARNING: container ports are published beyond loopback:%s\n' "$RED" "$NC" >&2
         printf '%s    %s%s\n' "$RED" "$bad" "$NC" >&2
         printf '%s  Bind them to 127.0.0.1 in docker-compose.yml, then: ./xf.sh down && ./xf.sh up%s\n' "$RED" "$NC" >&2
         printf '%s  Read docs/SECURITY.md before continuing.%s\n' "$RED" "$NC" >&2
@@ -113,6 +135,50 @@ check_engine_version() {
         printf '%s  Docker Engine %s is older than %s. Older engines can expose ports bound to 127.0.0.1 to the local network. Upgrade - see docs/SECURITY.md (Rule 1).%s\n' "$RED" "$v" "$MIN_ENGINE" "$NC"
     fi
 }
+
+# Runs the MariaDB client in the mariadb container without putting the
+# password on any command line. Command-line arguments are visible to every
+# local user through `ps` - including those of processes inside a container,
+# which on Linux are ordinary host processes. The password travels in the
+# MYSQL_PWD environment variable instead, readable only by the process owner
+# and root. `-e MYSQL_PWD` (a name, no value) copies it from this subshell's
+# environment into the container, so it never appears as an argument.
+#   db_client [--tty] [mariadb args...]   (--tty for an interactive prompt)
+db_client() {
+    local user name
+    user="$(env_get MARIADB_USER)"; [[ -n "$user" ]] || user=xenforo
+    name="$(env_get MARIADB_DATABASE)"; [[ -n "$name" ]] || name=xenforo
+    if [[ "${1:-}" == "--tty" ]]; then
+        shift
+        ( MYSQL_PWD="$(env_get MARIADB_PASSWORD)"; export MYSQL_PWD
+          compose exec -e MYSQL_PWD mariadb mariadb "-u$user" "$name" "$@" )
+    else
+        ( MYSQL_PWD="$(env_get MARIADB_PASSWORD)"; export MYSQL_PWD
+          compose exec -T -e MYSQL_PWD mariadb mariadb "-u$user" "$name" "$@" )
+    fi
+}
+
+# Refuses to let `reset` delete a directory that is not a disposable XenForo
+# webroot. XF_WEBROOT can be any path, and `reset` removes it recursively, so
+# a mistaken value (the pristine XF_SOURCE copy, a home directory, /) would
+# otherwise be deleted without further question.
+assert_safe_webroot() {
+    local w="$1" src
+    [[ -e "$w" ]] || return 0
+    case "$w" in
+        /|"$HOME"|"$HOME/"|"$STACK_DIR"|"$STACK_DIR/") die "Refusing to delete $w: XF_WEBROOT points at a directory that is not a webroot." ;;
+    esac
+    [[ -f "$w/src/XF.php" ]] || die "Refusing to delete $w: it does not contain src/XF.php, so it does not look like a XenForo webroot. Check XF_WEBROOT in stack/.env."
+    src="$(env_get XF_SOURCE)"
+    if [[ -n "$src" && -d "$src" ]] && [[ "$(cd "$w" && pwd -P)" == "$(cd "$src" && pwd -P)" ]]; then
+        die "Refusing to delete $w: it is XF_SOURCE, your reference copy of XenForo."
+    fi
+}
+
+# defaultaddon writes its argument into config.php inside a PHP string, via
+# sed. Restricting it to an add-on id shape keeps a quote from ending the PHP
+# string and keeps sed's special characters (& | \) out of the replacement.
+valid_addon_id() { [[ "$1" =~ ^[A-Za-z][A-Za-z0-9_]*(/[A-Za-z][A-Za-z0-9_]*)?$ ]]; }
 
 webroot_path() {
     local rel; rel="$(env_get XF_WEBROOT)"; [[ -n "$rel" ]] || rel="./webroot"
@@ -235,6 +301,11 @@ EOF
     mkdir -p "$WEBROOT/data" "$WEBROOT/internal_data"
 
     # ---- build and start ----------------------------------------------
+    # Before anything is published: an engine below the minimum can expose
+    # the 127.0.0.1 ports to the local network.
+    echo
+    check_engine_version
+
     echo
     echo "Building image (first build takes a few minutes)..."
     compose build
@@ -263,10 +334,7 @@ EOF
     # then refuses to install. Decide from the DATABASE whether this is a fresh
     # install — never from the lock file alone, or re-running setup could wipe a
     # working install.
-    DB_USER="$(env_get MARIADB_USER)"; [[ -n "$DB_USER" ]] || DB_USER=xenforo
-    DB_NAME="$(env_get MARIADB_DATABASE)"; [[ -n "$DB_NAME" ]] || DB_NAME=xenforo
-    DB_PASS="$(env_get MARIADB_PASSWORD)"
-    TABLES="$(compose exec -T mariadb mariadb "-u$DB_USER" "-p$DB_PASS" "$DB_NAME" -e 'SHOW TABLES' 2>/dev/null | grep -v '^Tables_in_' | grep -c . || true)"
+    TABLES="$(db_client -e 'SHOW TABLES' 2>/dev/null | grep -v '^Tables_in_' | grep -c . || true)"
 
     if [[ "${TABLES:-0}" -gt 0 ]]; then
         echo
@@ -289,13 +357,20 @@ EOF
         # statistics to XenForo. That prompt defaults to "yes", so accepting
         # defaults non-interactively would have switched it on.
         # --url: must include HTTP_PORT, or generated links point at port 80.
+        # The password is NOT passed as --password: command-line arguments
+        # are visible to every local user through `ps`, inside the container
+        # too. With no --password, xf:install reads it from stdin twice (entry
+        # and confirmation); with no terminal attached it reads plain lines.
         email="$(env_get XF_ADMIN_EMAIL)"; [[ -n "$email" ]] || email=admin@example.com
         title="$(env_get XF_BOARD_TITLE)"; [[ -n "$title" ]] || title="XenForo Dev"
-        in_container php cmd.php xf:install \
-            "--user=$(env_get XF_ADMIN_USER)" "--password=$(env_get XF_ADMIN_PASSWORD)" \
+        pass="$(env_get XF_ADMIN_PASSWORD)"
+        [[ -n "$pass" ]] || die "XF_ADMIN_PASSWORD is not set in stack/.env"
+        printf '%s\n%s\n' "$pass" "$pass" | in_container php cmd.php xf:install \
+            "--user=$(env_get XF_ADMIN_USER)" \
             "--email=$email" "--title=$title" "--url=$(board_url)" \
             --skip-statistics --clear \
             || die "xf:install failed. Inspect with: ./xf.sh log"
+        unset pass
     fi
 
     assert_no_public_bind
@@ -306,15 +381,20 @@ EOF
 ;;
 
 reset)
-    printf '%sThis destroys the containers, all volumes (database AND search index), and the webroot.%s\n' "$YEL" "$NC"
+    WEBROOT="$(webroot_path)"
+    assert_safe_webroot "$WEBROOT"
+    printf '%sThis destroys the containers, all volumes (database AND search index), and the webroot:%s\n' "$YEL" "$NC"
+    printf '%s    %s%s\n' "$YEL" "$WEBROOT" "$NC"
     read -r -p "Type RESET to confirm: " confirm
     [[ "$confirm" == "RESET" ]] || { echo "Aborted."; exit 0; }
     compose down -v
-    rm -rf "$(webroot_path)"
+    rm -rf "$WEBROOT"
     exec "$0" setup
 ;;
 
-up)      compose up -d; compose ps; assert_no_public_bind; check_engine_version ;;
+# The engine check runs before `up -d` so the warning comes before any port
+# is published, not after.
+up)      check_engine_version; compose up -d; compose ps; assert_no_public_bind ;;
 down)    compose down ;;
 restart) compose restart ;;
 build)   compose build ;;
@@ -351,6 +431,7 @@ reindex)
 
 defaultaddon)
     [[ $# -ge 1 ]] || die "Usage: ./xf.sh defaultaddon <Vendor/Id>"
+    valid_addon_id "$1" || die "Not an add-on id: '$1'. Expected Vendor/AddonId (letters, digits, underscore)."
     CFG="$(webroot_path)/src/config.php"
     sed "s|\(\$config\['development'\]\['defaultAddOn'\][[:space:]]*=[[:space:]]*'\)[^']*\('\)|\1$1\2|" "$CFG" > "$CFG.tmp"
     mv "$CFG.tmp" "$CFG"
@@ -398,9 +479,8 @@ doctor)
 
     echo
     echo "=== database ==="
-    DB_USER="$(env_get MARIADB_USER)"; [[ -n "$DB_USER" ]] || DB_USER=xenforo
     DB_NAME="$(env_get MARIADB_DATABASE)"; [[ -n "$DB_NAME" ]] || DB_NAME=xenforo
-    count="$(compose exec -T mariadb mariadb "-u$DB_USER" "-p$(env_get MARIADB_PASSWORD)" "$DB_NAME" -e 'SHOW TABLES' 2>/dev/null | grep -v '^Tables_in_' | grep -c . || true)"
+    count="$(db_client -e 'SHOW TABLES' 2>/dev/null | grep -v '^Tables_in_' | grep -c . || true)"
     if [[ "${count:-0}" -gt 0 ]]; then echo "  ok      $count tables in '$DB_NAME'"
     else printf '%s  no tables found — has XenForo been installed?%s\n' "$RED" "$NC"; fi
 
@@ -448,11 +528,8 @@ errors)
 log)   compose logs --tail 80 -f xenforo ;;
 shell) assert_running; compose exec -u www-data xenforo bash ;;
 
-db)
-    DB_USER="$(env_get MARIADB_USER)"; [[ -n "$DB_USER" ]] || DB_USER=xenforo
-    DB_NAME="$(env_get MARIADB_DATABASE)"; [[ -n "$DB_NAME" ]] || DB_NAME=xenforo
-    compose exec mariadb mariadb "-u$DB_USER" "-p$(env_get MARIADB_PASSWORD)" "$DB_NAME"
-;;
+# Extra arguments go to the client, so `./xf.sh db -e "SELECT ..."` runs one query.
+db)      db_client --tty "$@" ;;
 
 es)
     # Queried through the web container because Elasticsearch has no published

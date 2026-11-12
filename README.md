@@ -51,7 +51,7 @@ The same applies to XenForo Enhanced Search: the Elasticsearch service here is t
 | `xenforo` | Apache + PHP 8.4 (built here; 8.2–8.5 selectable) | `127.0.0.1:80` only |
 | `mariadb` | `mariadb:11.4` (LTS; 11.8 / 12.3 selectable) | **no** — reachable only inside the compose network |
 | `elasticsearch` | `elasticsearch:8.19.25` | **no** — and it must never be; see below |
-| `mailpit` *(optional)* | `axllent/mailpit:v1.33.0` | `127.0.0.1:8025`, only with `--profile mail` |
+| `mailpit` *(optional)* | `axllent/mailpit:v1.33.1` | `127.0.0.1:8025`, only with `--profile mail` |
 
 Every image is pinned to an explicit version in `stack/.env`. What changed between releases, and what to do on an existing stack, is in [CHANGELOG.md](CHANGELOG.md) and [docs/upgrading.md](docs/upgrading.md).
 

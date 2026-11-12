@@ -195,7 +195,7 @@ services:
     # Pinned like everything else. Mailpit had several 2026 security releases;
     # most affected instances with SMTP exposed to a network, which this one
     # is not (SMTP is reachable only inside the compose network).
-    image: axllent/mailpit:${MAILPIT_VERSION:-v1.33.0}
+    image: axllent/mailpit:${MAILPIT_VERSION:-v1.33.1}
     container_name: ${COMPOSE_PREFIX:-xf}-mailpit
     restart: unless-stopped
     security_opt: ["no-new-privileges:true"]

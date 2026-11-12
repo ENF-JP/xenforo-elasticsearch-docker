@@ -10,6 +10,10 @@ Commands below use `xf` for the helper — `./scripts/linux/xf.sh` on Linux/macO
 
 ## 1.0 → 1.1
 
+### Step 0 — If you use the Claude Code allowlist from 1.0, replace it first
+
+The 1.0 version of [ai-assisted.md](ai-assisted.md) suggested `Bash(curl http://localhost:*)` and `Bash(docker compose exec xenforo php cmd.php:*)` as allow rules. Both are wider than they look: the first lets an agent send `stack/.env` or any other readable file to another host without asking, and the second admits `xf-dev:export` and `xf:addon-uninstall`. Delete both from your `.claude/settings.json` and use the 1.1 version of the block, which asks before every `curl` and denies the destructive commands.
+
 ### Step 1 — Pull, then look at your `.env`
 
 ```bash
@@ -23,7 +27,7 @@ Your `stack/.env` is not touched by a pull, so **your stack keeps the versions i
 | `PHP_VERSION=8.3` | Optional: change to `8.4` (new default) or `8.5`. Safe both ways — PHP holds no data. |
 | `ES_VERSION=8.15.0` | Recommended: change to `8.19.25`. **One-way** — see step 3. |
 | `MARIADB_VERSION` | New and optional. Absent means `11.4`, as before. See step 4 before changing it. |
-| `MAILPIT_VERSION` | New and optional. Absent means `v1.33.0`. |
+| `MAILPIT_VERSION` | New and optional. Absent means `v1.33.1`. |
 | `PHP_TIMEZONE` | New and optional. Absent means `UTC`, as before. |
 | `XF_ADMIN_EMAIL`, `XF_BOARD_TITLE` | New. Used only by a fresh install; absent means `admin@example.com` / `XenForo Dev`. |
 | `COMPOSE_PROJECT_NAME` | **Do not add it to an existing stack.** It renames the volumes, and the stack would start empty (the old data stays on disk under the old name). It is only for a *second* stack. |
@@ -60,7 +64,8 @@ The default stays **11.4**, an LTS supported until 2029, so there is nothing to 
 ```bash
 # 1. dump first - this is the only way back
 docker compose -f stack/docker-compose.yml exec -T mariadb \
-  sh -c 'mariadb-dump -uroot -p"$MARIADB_ROOT_PASSWORD" --all-databases' > backup.sql
+  sh -c 'MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb-dump -uroot --all-databases' > backup.sql
+# (password via MYSQL_PWD inside the container, never on a command line)
 
 # 2. set MARIADB_VERSION=11.8 (or 12.3) in stack/.env, then:
 xf down && xf up
@@ -81,7 +86,7 @@ Expect the first build to take a few minutes. Your webroot, database and index a
 
 ### Step 6 — Nothing to do for these
 
-- **`no-new-privileges`** is applied to every service by the compose file; it takes effect on the next `xf up`.
+- **`no-new-privileges`** and `MARIADB_AUTO_UPGRADE` are set by the compose file. The first `xf up` after the pull **recreates all three containers** to apply them — expect "Recreate" lines. Your database, index and webroot are untouched (tested: 224 tables and a test search document survived it).
 - **`setup` changes** (unattended install, board URL with port, no usage statistics) apply only to a fresh install. An existing board keeps its settings. To stop an existing board sending usage statistics, untick **Send anonymous usage statistics** under Admin CP → Setup → Options → Statistics and metrics.
 - **`xf addon rebuild`** is a new command; nothing to configure.
 

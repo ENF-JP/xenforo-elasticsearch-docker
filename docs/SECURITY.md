@@ -46,7 +46,7 @@ ports:
   ```bash
   docker compose config | grep -A1 host_ip
   ```
-- Keep the automated check. Both helper scripts run `Assert-NoPublicBind` / `assert_no_public_bind` on `up` and `doctor`, which scans `docker ps` for `0.0.0.0:` and `[::]:` and warns in red.
+- Keep the automated check. Both helper scripts run `Assert-NoPublicBind` / `assert_no_public_bind` on `up` and `doctor`, which scans `docker ps` for any published port whose address is not `127.0.0.1` or `[::1]` — all interfaces (`0.0.0.0`, `[::]`) or a specific LAN address — and warns in red.
 
 - **Run Docker Engine 28.3.3 or later.** The `127.0.0.1:` prefix is only as good as the engine enforcing it. Before Engine 28.0, a machine on the same network segment could route packets straight to a loopback-bound published port on Linux; 28.0 closed that. Engines 28.2.0 to 28.3.2 then reopened it after any firewalld reload ([CVE-2025-54388](https://nvd.nist.gov/vuln/detail/cve-2025-54388)), fixed in 28.3.3. Check with `docker version --format '{{.Server.Version}}'`; `xf doctor` and `xf up` warn if it is older.
 
@@ -124,7 +124,8 @@ Not `root/root`. Not `admin/admin`. Not `xenforo/password`. Not "just for now".
   ```yaml
   MARIADB_PASSWORD: ${MARIADB_PASSWORD:?set it in .env}
   ```
-- On Linux/macOS, `chmod 600 .env`.
+- On Linux/macOS, keep `.env` at mode `600`. `xf.sh` sets it on creation and keeps it there every time it rewrites the file (before v1.1 a rewrite silently reset it to your default, usually world-readable `644`).
+- Keep secrets off command lines. Arguments are visible to every local user through `ps` — including those of processes inside a container, which on Linux are ordinary host processes. The helper scripts hand the database password over in `MYSQL_PWD` and the admin password on stdin; do the same in your own commands.
 
 **Don't:**
 - Don't commit `.env`. If you already have: rotate every secret in it, then purge the file from history (`git filter-repo`) — deleting it in a new commit leaves it fully readable in the old one.
@@ -175,7 +176,7 @@ The image and config here deliberately enable things that are dangerous in produ
 ## Rule 7 — Keep images current, and pin them deliberately
 
 **Do:**
-- Pin image versions (`mariadb:11.4`, `elasticsearch:8.19.25`, `axllent/mailpit:v1.33.0`, and the PECL extensions in the Dockerfile) so builds are reproducible and an upstream change cannot silently alter the stack. Every pin lives in `stack/.env` or the Dockerfile's `ARG` lines.
+- Pin image versions (`mariadb:11.4`, `elasticsearch:8.19.25`, `axllent/mailpit:v1.33.1`, and the PECL extensions in the Dockerfile) so builds are reproducible and an upstream change cannot silently alter the stack. Every pin lives in `stack/.env` or the Dockerfile's `ARG` lines.
 - Let the repository tell you when a pin is stale: a scheduled workflow opens a **pin-review issue** on the 1st of each month listing every pinned version, for a person to compare with upstream. Nothing updates itself — an Elasticsearch major bump in particular can break XFES without any error at startup, and a database or search-index upgrade cannot be undone once the volume has been opened by the newer version.
 - Refresh those pins on a schedule and rebuild: `docker compose pull && docker compose build --pull`.
 - Scan occasionally: `docker scout cves xenforo-dev-php:8.4-33`, or `trivy image <image>`.
@@ -212,7 +213,10 @@ The image and config here deliberately enable things that are dangerous in produ
 - Keep destructive commands off any AI agent's permission allowlist — see [ai-assisted.md](ai-assisted.md).
 - Take a dump before anything irreversible:
   ```bash
-  docker compose exec -T mariadb mariadb-dump -uxenforo -p"$PASS" xenforo > backup.sql
+  # run from stack/. The single quotes matter: the variables expand INSIDE the
+  # container, and the password goes in MYSQL_PWD, not on a command line
+  # where `ps` would show it to every local user.
+  docker compose exec -T mariadb sh -c 'MYSQL_PWD="$MARIADB_PASSWORD" mariadb-dump -u"$MARIADB_USER" "$MARIADB_DATABASE"' > backup.sql
   ```
 
 **Don't:**
@@ -256,7 +260,7 @@ curl -s --max-time 3 http://localhost:9200 && echo "^^ ES IS EXPOSED - remove it
 git status --porcelain | grep -E '\.env$' && echo "^^ do not commit .env"
 
 # 4. .env is not world-readable (Linux/macOS)
-stat -c '%a %n' stack/.env 2>/dev/null
+ls -l stack/.env        # must start -rw------- ; works on Linux and macOS alike
 
 # 5. Images are current
 docker compose pull --dry-run 2>/dev/null || docker compose pull
