@@ -189,6 +189,10 @@ With Windows' "Use Unicode UTF-8 for worldwide language support" option on, Wind
 
 `setup` pipes the admin password into `xf:install` (so it never appears on a command line), and a BOM in front of the first copy made it never match the confirmation. `xf.ps1` sets a BOM-free encoding around that one call and restores the console encoding afterwards. Do the same if you pipe anything that must arrive byte-exact.
 
+### Quotes inside `xf.ps1 db "..."` queries
+
+The same 5.1 quoting rule applies to SQL passed to `.\xf.ps1 db`: write string literals with single quotes inside a double-quoted query — `.\xf.ps1 db "SELECT username FROM xf_user WHERE username = 'admin'"`. A double quote inside the query is not escaped on its way to the client and splits it. A bare `-e` cannot be passed either (PowerShell reads it as `-ErrorAction`), so the query is simply the first argument.
+
 ### No `&&`, no ternary, no `??` in PowerShell 5.1
 
 Those are PowerShell 7 features. `xf.ps1` targets 5.1 so it runs on a stock Windows install with nothing extra. Use `;` with `if ($?)`, and explicit `if`/`else`.

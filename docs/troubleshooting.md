@@ -69,6 +69,10 @@ Versions before v1.1.0 did not pass `--email`, `--title`, `--url` or `--skip-sta
 
 On Windows, "Passwords did not match" on a version before v1.1's final build means PowerShell prefixed the piped text with a byte-order mark; see [platform-windows.md](platform-windows.md#piping-text-into-a-native-command-can-prepend-a-byte-order-mark).
 
+### `reset` says "Refusing to delete ..."
+
+Working as intended: `reset` deletes the webroot recursively, so it first checks the path is a disposable XenForo webroot. It refuses a folder without `src/XF.php`, `XF_SOURCE` or anything containing or inside it, a drive or filesystem root, your home folder, `stack/`, and a symbolic link or junction — including one anywhere in the path's parent folders on Windows. A webroot inside a **OneDrive** folder is refused for that last reason (OneDrive marks its folders as reparse points); keep the webroot outside synced folders anyway, since syncing 14,000 constantly changing files is slow and conflict-prone.
+
 ### `doctor` warns that the Docker Engine is older than 28.3.3
 
 Upgrade the engine (or Docker Desktop). This is a security warning, not a compatibility one: older engines can let other machines on your network reach ports bound to `127.0.0.1`. See [SECURITY.md](SECURITY.md), Rule 1. Podman numbers its versions differently; there the warning means "check", not "broken".

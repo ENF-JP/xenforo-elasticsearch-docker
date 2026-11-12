@@ -177,7 +177,11 @@ assert_safe_webroot() {
     # A symlinked webroot is refused, as on Windows: the prompt would show the
     # link's name, but `rm -rf link/` (with a trailing slash) deletes the
     # target's contents - a tree the user never saw named.
-    [[ ! -L "${w%/}" ]] || die "Refusing to delete $w: it is a symbolic link (to $real_w). Point XF_WEBROOT at a real directory."
+    # Strip EVERY trailing slash first: with "link//", ${w%/} would leave
+    # "link/", and -L on that follows the link and reports false.
+    local w_bare="$w"
+    while [[ "$w_bare" == */ && "$w_bare" != / ]]; do w_bare="${w_bare%/}"; done
+    [[ ! -L "$w_bare" ]] || die "Refusing to delete $w: it is a symbolic link (to $real_w). Point XF_WEBROOT at a real directory."
     src="$(env_get XF_SOURCE)"
     if [[ -n "$src" && -d "$src" ]]; then
         real_src="$(cd "$src" 2>/dev/null && pwd -P)" || real_src=""
@@ -525,7 +529,8 @@ doctor)
     # -L: XenForo answers "/" with a 301 to index.php, so without following
     # redirects a healthy board reports 301 - shown in red as a failure. A
     # few hops are plenty; xf.ps1's Invoke-WebRequest follows them too.
-    code="$(curl -s -L --max-redirs 3 -o /dev/null -w '%{http_code}' --max-time 15 "$(board_url)/" || true)"
+    # --proto-redir: a redirect may only go to http/https, never another scheme.
+    code="$(curl -s -L --max-redirs 3 --proto-redir =http,https -o /dev/null -w '%{http_code}' --max-time 15 "$(board_url)/" || true)"
     if [[ "$code" == "200" ]]; then echo "  $(board_url) -> $code"
     else printf '%s  %s -> %s%s\n' "$RED" "$(board_url)" "${code:-no response}" "$NC"; fi
 

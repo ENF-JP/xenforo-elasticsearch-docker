@@ -225,8 +225,16 @@ function Assert-SafeWebroot {
     # A junction or symlink is refused outright. Resolve-Path does not follow
     # links, so a link to XF_SOURCE would pass the comparison below. (Links
     # INSIDE the webroot are handled by Remove-DirectoryTree.)
-    if ((Get-Item -LiteralPath $full -Force).Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
-        throw "Refusing to delete ${full}: it is a junction or symbolic link. Point XF_WEBROOT at a real directory."
+    # Every ANCESTOR is checked too: Resolve-Path does not resolve links in
+    # parent folders, so D:\j\upload with D:\j a junction to E:\src would
+    # compare as unrelated to XF_SOURCE=E:\src\upload while being the same
+    # directory.
+    $probe = $full
+    while ($probe -and $probe.Length -gt [System.IO.Path]::GetPathRoot($full).Length) {
+        if ((Get-Item -LiteralPath $probe -Force).Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+            throw "Refusing to delete ${full}: $probe is a junction or symbolic link. Point XF_WEBROOT at a path made of real directories."
+        }
+        $probe = [System.IO.Path]::GetDirectoryName($probe)
     }
     $src = Get-EnvValue 'XF_SOURCE'
     if ($src -and (Test-Path -LiteralPath $src -PathType Container)) {
@@ -267,10 +275,21 @@ function Remove-DirectoryTree {
             Remove-DirectoryTree -Path $entry
         }
         else {
-            # Clear read-only so the delete is not refused.
-            [System.IO.File]::SetAttributes($entry, [System.IO.FileAttributes]::Normal)
+            # Clear only the read-only flag, and only on a real file, so the
+            # delete is not refused. Never on a file symlink (attributes could
+            # land on its target outside the webroot); on a hard link the flag
+            # is shared with the file's other names, so nothing else is touched.
+            if (($a -band [System.IO.FileAttributes]::ReadOnly) -and -not ($a -band [System.IO.FileAttributes]::ReparsePoint)) {
+                [System.IO.File]::SetAttributes($entry, ($a -band (-bnot [System.IO.FileAttributes]::ReadOnly)))
+            }
             [System.IO.File]::Delete($entry)
         }
+    }
+    # A read-only directory refuses deletion; clear the flag on the directory
+    # itself (a real directory here - links returned above).
+    $d = [System.IO.File]::GetAttributes($Path)
+    if ($d -band [System.IO.FileAttributes]::ReadOnly) {
+        [System.IO.File]::SetAttributes($Path, ($d -band (-bnot [System.IO.FileAttributes]::ReadOnly)))
     }
     [System.IO.Directory]::Delete($Path)
 }
@@ -618,7 +637,12 @@ src\ and cmd.php, or the upload\ directory from a XenForo release zip:
         $c = Read-Host "Type RESET to confirm"
         if ($c -ne 'RESET') { Write-Host "Aborted."; break }
         Invoke-Compose @('down', '-v') | Out-Null
-        if (Test-Path -LiteralPath $Webroot) { Remove-DirectoryTree -Path ((Resolve-Path -LiteralPath $Webroot).ProviderPath) }
+        if (Test-Path -LiteralPath $Webroot) {
+            # If the delete stops part-way (a locked file, an over-long path),
+            # nothing outside the webroot has been touched; say how to finish.
+            try { Remove-DirectoryTree -Path ((Resolve-Path -LiteralPath $Webroot).ProviderPath) }
+            catch { throw "The webroot was only partly deleted ($($_.Exception.Message)). Close anything using files in $Webroot, then run .\xf.ps1 reset again." }
+        }
         & $PSCommandPath 'setup'
     }
 
