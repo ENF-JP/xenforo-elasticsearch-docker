@@ -59,6 +59,28 @@ Get-NetTCPConnection -LocalPort 80 -State Listen | Select-Object OwningProcess
 
 Set `HTTP_PORT=8080` in `.env` and use <http://localhost:8080>. Update the board URL in the XenForo ACP so generated links match. **Keep the `127.0.0.1:` prefix** in the compose file — change the port, never the binding.
 
+### `setup` stopped at "Board URL" / "Primary board email", or aborted with `Aborted.`
+
+Versions before v1.1.0 did not pass `--email`, `--title`, `--url` or `--skip-statistics` to `xf:install`, so the installer stopped to ask. With no keyboard attached (CI, an AI agent, a pipe) it aborted. Update the checkout. The values now come from `XF_ADMIN_EMAIL`, `XF_BOARD_TITLE` and `HTTP_PORT` in `.env`, and usage statistics are never switched on.
+
+### `setup` fails at "Re-enter the administrator user password" or after "warnings were found when verifying requirements"
+
+`setup` hands the admin password to `xf:install` on stdin, so it never appears on a command line. If XenForo's requirement check prints **warnings**, it first asks "Are you sure you want to continue?" — and that question reads the line meant for the password, so the install stops. Nothing is disclosed; it just fails. Fix what the warning names (it is printed just above), or run the install once by hand: `./xf.sh shell`, then `php cmd.php xf:install --user=admin --email=... --url=... --skip-statistics` and answer the prompts.
+
+On Windows, "Passwords did not match" on a version before v1.1's final build means PowerShell prefixed the piped text with a byte-order mark; see [platform-windows.md](platform-windows.md#piping-text-into-a-native-command-can-prepend-a-byte-order-mark).
+
+### `reset` says "Refusing to delete ..."
+
+Working as intended: `reset` deletes the webroot recursively, so it first checks the path is a disposable XenForo webroot. It refuses a folder without `src/XF.php`, `XF_SOURCE` or anything containing or inside it, a drive or filesystem root, your home folder, `stack/`, and a symbolic link or junction — including one anywhere in the path's parent folders on Windows. A webroot inside a **OneDrive** folder is refused for that last reason (OneDrive marks its folders as reparse points); keep the webroot outside synced folders anyway, since syncing 14,000 constantly changing files is slow and conflict-prone.
+
+### `doctor` warns that the Docker Engine is older than 28.3.3
+
+Upgrade the engine (or Docker Desktop). This is a security warning, not a compatibility one: older engines can let other machines on your network reach ports bound to `127.0.0.1`. See [SECURITY.md](SECURITY.md), Rule 1. Podman numbers its versions differently; there the warning means "check", not "broken".
+
+### Image build fails with `cp: cannot stat 'modules/*'` on PHP 8.5
+
+The Dockerfile from before v1.1.0 tried to build OPcache as a separate extension, which PHP 8.5 no longer allows because OPcache is compiled in. Update the checkout.
+
 ### `xf setup` says XenForo is already installed, but the board is empty
 
 The database lives in a Docker volume while `internal_data/` lives on the host, so destroying the volume leaves `install-lock.php` behind. `setup` decides from the *database* (table count), not the lock file, and clears a stale lock automatically. If you genuinely want to start over: `xf reset`.
@@ -109,7 +131,8 @@ Depends what changed:
 | Changed | Needed |
 |---|---|
 | PHP class | Nothing — development mode picks it up immediately |
-| `_data/*.xml` | `xf import Vendor/AddonId` |
+| `_output/` dev files | `xf import Vendor/AddonId` (`xf-dev:import`) |
+| `_data/*.xml`, edited by hand | `xf addon rebuild Vendor/AddonId` (`xf:addon-rebuild`) |
 | Templates or phrases | `xf rebuild` |
 | `addon.json` version | `xf addon upgrade Vendor/AddonId` |
 | Anything, and still nothing | Check the mount is actually in place: `docker compose exec xenforo ls -la src/addons/Vendor/AddonId` |
@@ -210,5 +233,6 @@ xf setup
 Take a database dump first if there's anything in it you want:
 
 ```bash
-docker compose exec -T mariadb mariadb-dump -uxenforo -p"$PASS" xenforo > backup.sql
+# from stack/; variables expand inside the container, password via MYSQL_PWD
+docker compose exec -T mariadb sh -c 'MYSQL_PWD="$MARIADB_PASSWORD" mariadb-dump -u"$MARIADB_USER" "$MARIADB_DATABASE"' > backup.sql
 ```

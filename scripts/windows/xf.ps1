@@ -131,9 +131,181 @@ function Get-FromContainer {
     return (Get-ComposeOutput (@('exec', '-T', 'xenforo') + $Cmd))
 }
 
+function Invoke-InContainerWithInput {
+    <#
+      Runs a command in the web container as www-data, feeding InputLines to
+      its stdin, and returns only the exit code.
+
+      Used to hand a secret to a command that would otherwise need it as an
+      argument. Command-line arguments are visible to every local user
+      (`ps` on Linux and macOS, process listings on Windows) - including the
+      arguments of processes inside a container. Stdin is not.
+    #>
+    param([Parameter(Mandatory)][string[]] $InputLines, [Parameter(Mandatory)][string[]] $Cmd)
+    Push-Location $StackDir
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    # The text must reach the container without a byte-order mark, or the
+    # first line arrives as EF BB BF + password and never matches the
+    # confirmation line. Which setting decides the bytes differs by version:
+    #   - Windows PowerShell 5.1 encodes a native command's stdin with
+    #     [Console]::InputEncoding, which is UTF-8 WITH a BOM when Windows'
+    #     "Use Unicode UTF-8 for worldwide language support" option is on.
+    #     It ignores $OutputEncoding here (verified on 5.1.26100).
+    #   - PowerShell 7 uses $OutputEncoding.
+    # Both are set BOM-free for this call. $OutputEncoding is a local
+    # assignment; the console encoding is process-wide, so it is restored.
+    # Setting it throws when no console is attached - then it is left alone.
+    $noBom = New-Object System.Text.UTF8Encoding($false)
+    $OutputEncoding = $noBom
+    $prevIn = $null
+    try { $prevIn = [Console]::InputEncoding; [Console]::InputEncoding = $noBom } catch { $prevIn = $null }
+    try {
+        $InputLines | & (Resolve-DockerBin) (@('compose', 'exec', '-T', '-u', 'www-data', 'xenforo') + $Cmd) | Out-Host
+        return $LASTEXITCODE
+    }
+    finally {
+        if ($null -ne $prevIn) {
+            try { [Console]::InputEncoding = $prevIn }
+            catch { Write-Verbose "Could not restore the console input encoding: $($_.Exception.Message)" }
+        }
+        $ErrorActionPreference = $prev
+        Pop-Location
+    }
+}
+
+function Get-DbClientCommand {
+    <#
+      Returns the `compose exec` arguments that start the MariaDB client in
+      the mariadb container. The password is not among them: the callers put
+      it in the MYSQL_PWD environment variable of this process for the length
+      of the call, and `-e MYSQL_PWD` (a name, no value) copies it into the
+      container. Environment variables are readable only by the process owner
+      and administrators; command-line arguments are readable by every user.
+    #>
+    param([switch] $Interactive)
+    $u = Get-EnvValue 'MARIADB_USER'; if (-not $u) { $u = 'xenforo' }
+    $n = Get-EnvValue 'MARIADB_DATABASE'; if (-not $n) { $n = 'xenforo' }
+    $a = @('exec')
+    if (-not $Interactive) { $a += '-T' }
+    return ($a + @('-e', 'MYSQL_PWD', 'mariadb', 'mariadb', "-u$u", $n))
+}
+
+function Get-DbOutput {
+    <# Runs one MariaDB client call (e.g. -e 'SHOW TABLES') and returns its output lines. #>
+    param([Parameter(Mandatory)][string[]] $SqlArgs)
+    $had = Test-Path Env:MYSQL_PWD; $old = $env:MYSQL_PWD
+    $env:MYSQL_PWD = Get-EnvValue 'MARIADB_PASSWORD'
+    try { return (Get-ComposeOutput ((Get-DbClientCommand) + $SqlArgs)) }
+    finally { if ($had) { $env:MYSQL_PWD = $old } else { Remove-Item Env:MYSQL_PWD -ErrorAction SilentlyContinue } }
+}
+
+function Assert-SafeWebroot {
+    <#
+      Throws unless the path is a disposable XenForo webroot that `reset` may
+      delete. XF_WEBROOT can be any path, and `reset` removes it recursively,
+      so a mistaken value (the pristine XF_SOURCE copy, a profile folder, a
+      drive root) would otherwise be deleted without further question.
+    #>
+    param([Parameter(Mandatory)][string] $Path)
+    # -LiteralPath and plain string comparisons throughout: [ ] ? * are legal
+    # in Windows folder names, and the wildcard-aware forms would treat them
+    # as patterns - making a comparison miss, or matching sibling folders.
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    $full = (Resolve-Path -LiteralPath $Path).ProviderPath.TrimEnd('\')
+    $forbidden = @([System.IO.Path]::GetPathRoot($full).TrimEnd('\'), $env:USERPROFILE.TrimEnd('\'), $StackDir.TrimEnd('\'))
+    foreach ($f in $forbidden) {
+        if ([string]::Equals($full, $f, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Refusing to delete ${full}: XF_WEBROOT points at a directory that is not a webroot."
+        }
+    }
+    if (-not (Test-Path -LiteralPath ([System.IO.Path]::Combine($full, 'src', 'XF.php')))) {
+        throw "Refusing to delete ${full}: it does not contain src\XF.php, so it does not look like a XenForo webroot. Check XF_WEBROOT in stack\.env."
+    }
+    # A junction or symlink is refused outright. Resolve-Path does not follow
+    # links, so a link to XF_SOURCE would pass the comparison below. (Links
+    # INSIDE the webroot are handled by Remove-DirectoryTree.)
+    # Every ANCESTOR is checked too: Resolve-Path does not resolve links in
+    # parent folders, so D:\j\upload with D:\j a junction to E:\src would
+    # compare as unrelated to XF_SOURCE=E:\src\upload while being the same
+    # directory.
+    $probe = $full
+    while ($probe -and $probe.Length -gt [System.IO.Path]::GetPathRoot($full).Length) {
+        if ((Get-Item -LiteralPath $probe -Force).Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+            throw "Refusing to delete ${full}: $probe is a junction or symbolic link. Point XF_WEBROOT at a path made of real directories."
+        }
+        $probe = [System.IO.Path]::GetDirectoryName($probe)
+    }
+    $src = Get-EnvValue 'XF_SOURCE'
+    if ($src -and (Test-Path -LiteralPath $src -PathType Container)) {
+        $srcFull = (Resolve-Path -LiteralPath $src).ProviderPath.TrimEnd('\')
+        # Equal, or one inside the other: deleting the webroot would take
+        # XF_SOURCE with it (or the webroot IS part of XF_SOURCE). Ordinal,
+        # case-insensitive prefix tests with a trailing separator, so
+        # D:\xf is not mistaken for a parent of D:\xf2.
+        $ic = [System.StringComparison]::OrdinalIgnoreCase
+        if ("$srcFull\".StartsWith("$full\", $ic)) { throw "Refusing to delete ${full}: XF_SOURCE ($src) is inside it." }
+        if ("$full\".StartsWith("$srcFull\", $ic)) { throw "Refusing to delete ${full}: it is inside XF_SOURCE ($src), your reference copy of XenForo." }
+    }
+}
+
+function Remove-DirectoryTree {
+    <#
+      Deletes a directory tree WITHOUT following junctions or symbolic links
+      inside it. A link is removed as a link; whatever it points to is left
+      alone.
+
+      Why not Remove-Item -Recurse: on some Windows PowerShell 5.1 builds it
+      follows a directory junction and deletes the target's contents
+      (PowerShell issue #621). A webroot can legitimately contain one - an
+      add-on folder linked in from the developer's working repository - and
+      `reset` must not empty that repository. [IO.Directory]::Delete with
+      recursion refuses ("access denied") on a junction instead.
+    #>
+    param([Parameter(Mandatory)][string] $Path)
+    $attrs = [System.IO.File]::GetAttributes($Path)
+    if ($attrs -band [System.IO.FileAttributes]::ReparsePoint) {
+        # Non-recursive delete of a link removes the link only.
+        [System.IO.Directory]::Delete($Path)
+        return
+    }
+    foreach ($entry in [System.IO.Directory]::GetFileSystemEntries($Path)) {
+        $a = [System.IO.File]::GetAttributes($entry)
+        if ($a -band [System.IO.FileAttributes]::Directory) {
+            Remove-DirectoryTree -Path $entry
+        }
+        else {
+            # Clear only the read-only flag, and only on a real file, so the
+            # delete is not refused. Never on a file symlink (attributes could
+            # land on its target outside the webroot); on a hard link the flag
+            # is shared with the file's other names, so nothing else is touched.
+            if (($a -band [System.IO.FileAttributes]::ReadOnly) -and -not ($a -band [System.IO.FileAttributes]::ReparsePoint)) {
+                [System.IO.File]::SetAttributes($entry, ($a -band (-bnot [System.IO.FileAttributes]::ReadOnly)))
+            }
+            [System.IO.File]::Delete($entry)
+        }
+    }
+    # A read-only directory refuses deletion; clear the flag on the directory
+    # itself (a real directory here - links returned above).
+    $d = [System.IO.File]::GetAttributes($Path)
+    if ($d -band [System.IO.FileAttributes]::ReadOnly) {
+        [System.IO.File]::SetAttributes($Path, ($d -band (-bnot [System.IO.FileAttributes]::ReadOnly)))
+    }
+    [System.IO.Directory]::Delete($Path)
+}
+
 function Assert-Running {
-    $out = Get-ComposeOutput @('ps', '--services', '--filter', 'status=running')
-    if ($out -notmatch 'xenforo') {
+    <#
+      Throws unless the xenforo service is running.
+
+      The match is an exact per-line comparison. `$out -notmatch 'xenforo'`
+      looks equivalent but is not: on an array, -notmatch returns the
+      elements that do NOT match ('elasticsearch', 'mariadb'), which is a
+      non-empty, truthy array whenever the other services are up - so it
+      threw "not running" on a perfectly healthy stack.
+    #>
+    $out = @(Get-ComposeOutput @('ps', '--services', '--filter', 'status=running'))
+    if (-not ($out | Where-Object { "$_".Trim() -eq 'xenforo' })) {
         throw "The web container is not running. Start it with: .\xf.ps1 up"
     }
 }
@@ -163,6 +335,21 @@ function Set-EnvValue {
     [System.IO.File]::WriteAllText($EnvFile, (($lines -join "`n") + "`n"), (New-Object System.Text.UTF8Encoding($false)))
 }
 
+function Get-WebrootPath {
+    <#
+      Returns the full path of the webroot the container serves.
+
+      XF_WEBROOT may be relative (resolved from stack\, the default
+      ./webroot) or absolute. Join-Path alone would glue an absolute path
+      onto stack\ and produce a path that does not exist, so rooted paths
+      are returned as they are.
+    #>
+    $rel = Get-EnvValue 'XF_WEBROOT'
+    if (-not $rel) { $rel = './webroot' }
+    if ([System.IO.Path]::IsPathRooted($rel)) { return $rel }
+    return (Join-Path $StackDir ($rel -replace '^\./', ''))
+}
+
 function New-Secret {
     param([int] $Length = 32)
     # Alphanumeric only: '/', '+' and '=' from base64 need escaping in .env,
@@ -174,21 +361,58 @@ function New-Secret {
     -join ($bytes | ForEach-Object { [char]$chars[$_ % $chars.Count] })
 }
 
+# Minimum Docker Engine that keeps loopback-bound ports private. Engine 28.0
+# stopped other hosts on the same network from reaching ports published on
+# 127.0.0.1; 28.2.0-28.3.2 then reopened them after a firewalld reload
+# (CVE-2025-54388), fixed in 28.3.3. Rule 1 in docs/SECURITY.md depends on it.
+$script:MinEngine = [version]'28.3.3'
+
+function Test-EngineVersion {
+    <#
+      Prints whether the Docker Engine is new enough to keep 127.0.0.1-bound
+      ports private. Warns, never throws: Podman and other engines report
+      their own version numbering, so a warning there is a prompt to check.
+    #>
+    $raw = (Get-DockerOutput @('version', '--format', '{{.Server.Version}}')) -join ''
+    # Strip suffixes such as "-rd" or "+dfsg1" before parsing.
+    $clean = ($raw -split '[-+]')[0].Trim()
+    $v = $null
+    if (-not [version]::TryParse($clean, [ref] $v)) {
+        Write-Host "  could not read the Docker Engine version ($raw)" -ForegroundColor Yellow
+    }
+    elseif ($v -ge $script:MinEngine) {
+        Write-Host "  ok      Docker Engine $clean"
+    }
+    else {
+        Write-Host "  Docker Engine $clean is older than $($script:MinEngine). Older engines can expose ports bound to 127.0.0.1 to the local network. Upgrade - see docs/SECURITY.md (Rule 1)." -ForegroundColor Red
+    }
+}
+
 function Assert-NoPublicBind {
     <#
-      Refuses to stay quiet if a container port is bound to all interfaces.
+      Refuses to stay quiet if a container port is published beyond loopback.
       The stack this is derived from was compromised in ~76 minutes because of
       a bare "3306:3306". See docs/SECURITY.md.
+
+      Docker lists ports as "127.0.0.1:80->80/tcp, 9200/tcp": entries with
+      "->" are published, the rest are only exposed inside the network. For
+      each published entry the address before ":<port>->" must be 127.0.0.1
+      or [::1]. That catches 0.0.0.0 and [::] (all interfaces) and also a
+      specific LAN address, which is just as reachable from the network.
     #>
     $rows = Get-DockerOutput @('ps', '--format', '{{.Names}}|{{.Ports}}')
     $bad = @()
     foreach ($r in $rows) {
         if (-not $r) { continue }
         $name, $ports = $r -split '\|', 2
-        if ($ports -match '0\.0\.0\.0:|\[::\]:') { $bad += "$name -> $ports" }
+        foreach ($entry in ($ports -split ',\s*')) {
+            if ($entry -match '^(.+?):\d+(-\d+)?->' -and $Matches[1] -ne '127.0.0.1' -and $Matches[1] -ne '[::1]') {
+                $bad += "$name -> $ports"; break
+            }
+        }
     }
     if ($bad.Count) {
-        Write-Host "WARNING: container ports are published on ALL interfaces:" -ForegroundColor Red
+        Write-Host "WARNING: container ports are published beyond loopback:" -ForegroundColor Red
         $bad | ForEach-Object { Write-Host "    $_" -ForegroundColor Red }
         Write-Host "  Bind them to 127.0.0.1 in docker-compose.yml, then: .\xf.ps1 down; .\xf.ps1 up" -ForegroundColor Red
         Write-Host "  Read docs/SECURITY.md before continuing." -ForegroundColor Red
@@ -213,19 +437,20 @@ XenForo + Elasticsearch dev stack (Windows)
 
   XenForo
     cli <args...>         php cmd.php <args>   e.g.  cli xf:addon-list
-    addon install|upgrade|enable|disable|uninstall <Vendor/Id>
-    import <Vendor/Id>    xf-dev:import --addon=<Vendor/Id>
-    export <Vendor/Id>    xf-addon:export <Vendor/Id>
+    addon install|upgrade|rebuild|enable|disable|uninstall <Vendor/Id>
+                          (rebuild = re-import the add-on's _data/ XML)
+    import <Vendor/Id>    _output/ dev files -> database   (xf-dev:import)
+    export <Vendor/Id>    database -> _data/ XML           (xf-addon:export)
     rebuild               xf-dev:rebuild-caches
     reindex               xf-rebuild:search  (full Elasticsearch reindex)
     defaultaddon <V/Id>   Set development.defaultAddOn in config.php
 
   Diagnostics
-    doctor                Check ports, PHP extensions, DB, Elasticsearch, HTTP
+    doctor                Check engine, ports, PHP extensions, DB, Elasticsearch, HTTP
     errors [n]            Show the last n XenForo errors (default 5)
     log                   Tail the Apache error log
     shell                 Bash shell in the web container
-    db                    MariaDB client
+    db ['SQL']            MariaDB client, or run one query
     es [path]             Query Elasticsearch  (default: _cat/indices?v)
     xdebug on|off         Toggle Xdebug (off is roughly twice as fast)
     creds                 Show the ACP URL and admin credentials
@@ -251,9 +476,7 @@ XenForo + Elasticsearch dev stack (Windows)
         if (-not (Get-EnvValue 'XF_ADMIN_USER')) { Set-EnvValue 'XF_ADMIN_USER' 'admin' }
 
         # ---- webroot ----------------------------------------------------
-        $webrootRel = Get-EnvValue 'XF_WEBROOT'
-        if (-not $webrootRel) { $webrootRel = './webroot' }
-        $Webroot = Join-Path $StackDir ($webrootRel -replace '^\./', '')
+        $Webroot = Get-WebrootPath
 
         if (-not (Test-Path $Webroot)) {
             $source = Get-EnvValue 'XF_SOURCE'
@@ -265,7 +488,7 @@ XenForo is commercial software and is not distributed with this repo. Point
 XF_SOURCE at your own licensed copy - either an unpacked directory containing
 src\ and cmd.php, or the upload\ directory from a XenForo release zip:
 
-    XF_SOURCE=G:\sources\xenforo_2.3.12\upload
+    XF_SOURCE=G:\sources\xenforo_2.3.x\upload
 "@
             }
             if (-not (Test-Path $source)) { throw "XF_SOURCE path does not exist: $source" }
@@ -305,6 +528,11 @@ src\ and cmd.php, or the upload\ directory from a XenForo release zip:
         }
 
         # ---- build and start --------------------------------------------
+        # Before anything is published: an engine below the minimum can expose
+        # the 127.0.0.1 ports to the local network.
+        Write-Host ""
+        Test-EngineVersion
+
         Write-Host "`nBuilding image (first build takes a few minutes)..."
         if ((Invoke-Compose @('build')) -ne 0) { throw "Image build failed." }
 
@@ -332,10 +560,7 @@ src\ and cmd.php, or the upload\ directory from a XenForo release zip:
         # XenForo then refuses to install. Decide from the DATABASE whether this
         # is a fresh install - never from the lock file alone, or re-running
         # setup could wipe a working install.
-        $dbUser = Get-EnvValue 'MARIADB_USER'; if (-not $dbUser) { $dbUser = 'xenforo' }
-        $dbName = Get-EnvValue 'MARIADB_DATABASE'; if (-not $dbName) { $dbName = 'xenforo' }
-        $dbPass = Get-EnvValue 'MARIADB_PASSWORD'
-        $tables = Get-ComposeOutput @('exec', '-T', 'mariadb', 'mariadb', "-u$dbUser", "-p$dbPass", $dbName, '-e', 'SHOW TABLES')
+        $tables = Get-DbOutput @('-e', 'SHOW TABLES')
         $tableCount = @($tables | Where-Object { $_ -and $_ -notmatch '^Tables_in_' }).Count
 
         if ($tableCount -gt 0) {
@@ -358,9 +583,41 @@ src\ and cmd.php, or the upload\ directory from a XenForo release zip:
             $adminUser = Get-EnvValue 'XF_ADMIN_USER'
             $adminPass = Get-EnvValue 'XF_ADMIN_PASSWORD'
             if (-not $adminPass) { throw "XF_ADMIN_PASSWORD is not set in .env" }
-            if ((Invoke-InContainer @('php', 'cmd.php', 'xf:install', "--user=$adminUser", "--password=$adminPass", '--clear')) -ne 0) {
+            $email = Get-EnvValue 'XF_ADMIN_EMAIL'; if (-not $email) { $email = 'admin@example.com' }
+            $title = Get-EnvValue 'XF_BOARD_TITLE'; if (-not $title) { $title = 'XenForo Dev' }
+            $iport = Get-EnvValue 'HTTP_PORT'; if (-not $iport) { $iport = '80' }
+            $iurl  = "http://localhost"; if ($iport -ne '80') { $iurl = "http://localhost:$iport" }
+            # Every value xf:install would otherwise ask for is passed
+            # explicitly, so setup runs unattended (CI, an AI agent, a script).
+            # Without them the installer stops to prompt, and with no input it
+            # aborts.
+            # --skip-statistics: never opt a dev board into sending usage
+            # statistics to XenForo. That prompt defaults to "yes", so
+            # accepting defaults non-interactively would have switched it on.
+            # --url: must include HTTP_PORT, or generated links point at port 80.
+            # The password is NOT passed as --password: command-line arguments
+            # are visible to every local user, inside the container too. With
+            # no --password, xf:install reads it from stdin twice (entry and
+            # confirmation); with no terminal attached it reads plain lines.
+            #
+            # Windows PowerShell 5.1 does not escape a double quote inside a
+            # native command's argument, so a " in the title or email would
+            # split it into extra xf:install arguments. A trailing backslash
+            # does the same to an argument containing spaces: it turns the
+            # closing quote into \" and swallows the next argument. Refuse both.
+            foreach ($pair in @(@('XF_BOARD_TITLE', $title), @('XF_ADMIN_EMAIL', $email), @('XF_ADMIN_USER', $adminUser))) {
+                if ($pair[1] -match '"' -or $pair[1] -match '\\$') {
+                    throw "$($pair[0]) in stack\.env must not contain a double quote or end with a backslash."
+                }
+            }
+            $installArgs = @('php', 'cmd.php', 'xf:install',
+                "--user=$adminUser",
+                "--email=$email", "--title=$title", "--url=$iurl",
+                '--skip-statistics', '--clear')
+            if ((Invoke-InContainerWithInput -InputLines @($adminPass, $adminPass) -Cmd $installArgs) -ne 0) {
                 throw "xf:install failed. Inspect with: .\xf.ps1 log"
             }
+            $adminPass = $null
         }
 
         Assert-NoPublicBind
@@ -373,17 +630,25 @@ src\ and cmd.php, or the upload\ directory from a XenForo release zip:
     }
 
     'reset' {
-        Write-Host "This destroys the containers, all volumes (database AND search index), and the webroot." -ForegroundColor Yellow
+        $Webroot = Get-WebrootPath
+        Assert-SafeWebroot $Webroot
+        Write-Host "This destroys the containers, all volumes (database AND search index), and the webroot:" -ForegroundColor Yellow
+        Write-Host "    $Webroot" -ForegroundColor Yellow
         $c = Read-Host "Type RESET to confirm"
         if ($c -ne 'RESET') { Write-Host "Aborted."; break }
         Invoke-Compose @('down', '-v') | Out-Null
-        $webrootRel = Get-EnvValue 'XF_WEBROOT'; if (-not $webrootRel) { $webrootRel = './webroot' }
-        $Webroot = Join-Path $StackDir ($webrootRel -replace '^\./', '')
-        if (Test-Path $Webroot) { Remove-Item $Webroot -Recurse -Force }
+        if (Test-Path -LiteralPath $Webroot) {
+            # If the delete stops part-way (a locked file, an over-long path),
+            # nothing outside the webroot has been touched; say how to finish.
+            try { Remove-DirectoryTree -Path ((Resolve-Path -LiteralPath $Webroot).ProviderPath) }
+            catch { throw "The webroot was only partly deleted ($($_.Exception.Message)). Close anything using files in $Webroot, then run .\xf.ps1 reset again." }
+        }
         & $PSCommandPath 'setup'
     }
 
-    'up'      { Invoke-Compose @('up', '-d') | Out-Null; Invoke-Compose @('ps') | Out-Null; Assert-NoPublicBind }
+    # The engine check runs before `up -d`, so the warning comes before any
+    # port is published.
+    'up'      { Test-EngineVersion; Invoke-Compose @('up', '-d') | Out-Null; Invoke-Compose @('ps') | Out-Null; Assert-NoPublicBind }
     'down'    { Invoke-Compose @('down') | Out-Null }
     'restart' { Invoke-Compose @('restart') | Out-Null }
     'build'   { Invoke-Compose @('build') | Out-Null }
@@ -396,10 +661,13 @@ src\ and cmd.php, or the upload\ directory from a XenForo release zip:
 
     'addon' {
         Assert-Running
-        if ($Rest.Count -lt 2) { throw "Usage: .\xf.ps1 addon install|upgrade|enable|disable|uninstall <Vendor/Id>" }
+        if ($Rest.Count -lt 2) { throw "Usage: .\xf.ps1 addon install|upgrade|rebuild|enable|disable|uninstall <Vendor/Id>" }
         $action = $Rest[0]; $id = $Rest[1]
+        # rebuild re-imports the add-on's _data/ XML into the database without
+        # a version bump - what you need after editing _data/ by hand.
         $map = @{
             'install'   = 'xf:addon-install';   'upgrade' = 'xf:addon-upgrade'
+            'rebuild'   = 'xf:addon-rebuild'
             'enable'    = 'xf:addon-enable';    'disable' = 'xf:addon-disable'
             'uninstall' = 'xf:addon-uninstall'
         }
@@ -430,8 +698,13 @@ src\ and cmd.php, or the upload\ directory from a XenForo release zip:
 
     'defaultaddon' {
         if (-not $Rest) { throw "Usage: .\xf.ps1 defaultaddon <Vendor/Id>" }
-        $webrootRel = Get-EnvValue 'XF_WEBROOT'; if (-not $webrootRel) { $webrootRel = './webroot' }
-        $cfg = Join-Path (Join-Path $StackDir ($webrootRel -replace '^\./', '')) 'src\config.php'
+        # The id is written into a PHP string in config.php, through a regex
+        # replacement. An id shape keeps a quote from ending the PHP string and
+        # keeps $ (special in the replacement) out of it.
+        if ($Rest[0] -notmatch '^[A-Za-z][A-Za-z0-9_]*(/[A-Za-z][A-Za-z0-9_]*)?$') {
+            throw "Not an add-on id: '$($Rest[0])'. Expected Vendor/AddonId (letters, digits, underscore)."
+        }
+        $cfg = Join-Path (Get-WebrootPath) 'src\config.php'
         $txt = Get-Content $cfg -Raw
         $new = [regex]::Replace($txt, "(\`$config\['development'\]\['defaultAddOn'\]\s*=\s*')[^']*(')", "`${1}$($Rest[0])`${2}")
         [System.IO.File]::WriteAllText($cfg, $new)
@@ -447,7 +720,10 @@ src\ and cmd.php, or the upload\ directory from a XenForo release zip:
     }
 
     'doctor' {
-        Write-Host "=== containers ==="
+        Write-Host "=== Docker Engine ==="
+        Test-EngineVersion
+
+        Write-Host "`n=== containers ==="
         Invoke-Compose @('ps') | Out-Null
 
         Write-Host "`n=== port exposure ==="
@@ -459,7 +735,10 @@ src\ and cmd.php, or the upload\ directory from a XenForo release zip:
         # mangles double quotes inside a native command's arguments, so the -r
         # variant reaches PHP malformed and reports every extension missing.
         # -m needs no quoting at all.
-        $required = 'mysqli','gd','json','pcre','ctype','iconv','mbstring','openssl','SimpleXML','filter','hash','session','zip','intl','curl','zlib'
+        # XenForo's installer requires mysqli, gd, iconv, ctype, pcre, json,
+        # curl, mbstring, dom and SimpleXML. The rest are ones this image adds
+        # because add-ons and XenForo features commonly use them.
+        $required = 'mysqli','gd','json','pcre','ctype','iconv','mbstring','openssl','SimpleXML','dom','filter','hash','session','zip','intl','curl','zlib'
         $have = Get-FromContainer @('php', '-m')
         $missing = 0
         foreach ($e in $required) {
@@ -474,10 +753,8 @@ src\ and cmd.php, or the upload\ directory from a XenForo release zip:
         Write-Host "`n=== database ==="
         # SHOW TABLES, not a SELECT with a quoted table_schema - same PowerShell
         # 5.1 quoting problem as above.
-        $dbUser = Get-EnvValue 'MARIADB_USER'; if (-not $dbUser) { $dbUser = 'xenforo' }
         $dbName = Get-EnvValue 'MARIADB_DATABASE'; if (-not $dbName) { $dbName = 'xenforo' }
-        $dbPass = Get-EnvValue 'MARIADB_PASSWORD'
-        $tbl = Get-ComposeOutput @('exec', '-T', 'mariadb', 'mariadb', "-u$dbUser", "-p$dbPass", $dbName, '-e', 'SHOW TABLES')
+        $tbl = Get-DbOutput @('-e', 'SHOW TABLES')
         $count = @($tbl | Where-Object { $_ -and $_ -notmatch '^Tables_in_' }).Count
         if ($count -gt 0) { Write-Host "  ok      $count tables in '$dbName'" }
         else { Write-Host "  no tables found - has XenForo been installed?" -ForegroundColor Red }
@@ -514,8 +791,7 @@ src\ and cmd.php, or the upload\ directory from a XenForo release zip:
     'errors' {
         $n = 5
         if ($Rest -and $Rest[0] -match '^\d+$') { $n = [int]$Rest[0] }
-        $webrootRel = Get-EnvValue 'XF_WEBROOT'; if (-not $webrootRel) { $webrootRel = './webroot' }
-        $logPath = Join-Path (Join-Path $StackDir ($webrootRel -replace '^\./', '')) 'internal_data\error_log.php'
+        $logPath = Join-Path (Get-WebrootPath) 'internal_data\error_log.php'
         if (-not (Test-Path $logPath)) { Write-Host "No error_log.php yet - nothing has errored."; break }
         # XenForo writes each entry as a PHP block; show the tail of the raw file.
         Get-Content $logPath -Tail ($n * 12)
@@ -525,9 +801,17 @@ src\ and cmd.php, or the upload\ directory from a XenForo release zip:
     'shell' { Assert-Running; Invoke-DockerInteractive @('compose', '--project-directory', $StackDir, 'exec', '-u', 'www-data', 'xenforo', 'bash') }
 
     'db' {
-        $dbUser = Get-EnvValue 'MARIADB_USER'; if (-not $dbUser) { $dbUser = 'xenforo' }
-        $dbName = Get-EnvValue 'MARIADB_DATABASE'; if (-not $dbName) { $dbName = 'xenforo' }
-        Invoke-DockerInteractive @('compose', '--project-directory', $StackDir, 'exec', 'mariadb', 'mariadb', "-u$dbUser", "-p$(Get-EnvValue 'MARIADB_PASSWORD')", $dbName)
+        # Password via MYSQL_PWD for the length of the session; see Get-DbClientCommand.
+        $had = Test-Path Env:MYSQL_PWD; $old = $env:MYSQL_PWD
+        $env:MYSQL_PWD = Get-EnvValue 'MARIADB_PASSWORD'
+        # .\xf.ps1 db 'SELECT ...' runs one query. A bare -e cannot be used
+        # here: this script takes PowerShell's common parameters, and -e is
+        # read as an ambiguous abbreviation of -ErrorAction / -ErrorVariable.
+        # So a first argument that is not an option is treated as the query.
+        $extra = @($Rest | Where-Object { $_ })
+        if ($extra.Count -and -not $extra[0].StartsWith('-')) { $extra = @('-e', ($extra -join ' ')) }
+        try { Invoke-DockerInteractive (@('compose', '--project-directory', $StackDir) + (Get-DbClientCommand -Interactive) + $extra) }
+        finally { if ($had) { $env:MYSQL_PWD = $old } else { Remove-Item Env:MYSQL_PWD -ErrorAction SilentlyContinue } }
     }
 
     'es' {

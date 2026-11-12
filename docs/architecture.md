@@ -12,14 +12,14 @@ Every choice here has a trade-off. This document records what was chosen, what w
               │  127.0.0.1:80
               ▼
       ┌───────────────┐
-      │   xenforo     │  Apache + PHP 8.3
+      │   xenforo     │  Apache + PHP 8.4
       │  (webroot)    │
       └───┬───────┬───┘
           │       │        compose network — no host ports
           ▼       ▼
    ┌──────────┐  ┌───────────────┐
    │ mariadb  │  │ elasticsearch │
-   │ 11.4     │  │ 8.15          │
+   │ 11.4     │  │ 8.19          │
    └──────────┘  └───────────────┘
 ```
 
@@ -37,14 +37,21 @@ Only the web container publishes a port. The other two are reachable by service 
 
 ---
 
-## PHP 8.3 by default
+## PHP 8.4 by default
 
-XenForo 2.3 requires PHP 8.1 minimum. 8.3 is a deliberate middle: new enough to catch deprecations early, old enough that every add-on ecosystem dependency works.
+XenForo 2.3's installer accepts **PHP 7.2 and up**. The official `php` images only carry maintained PHP branches, so this stack can build **8.2, 8.3, 8.4 or 8.5**. 8.4 is the default: it is in active support (8.3 receives security fixes only), and every extension the image installs supports it. 8.5 is the newest release and the one to test deprecations against.
 
 ```bash
-docker compose build --build-arg PHP_VERSION=8.4
+docker compose build --build-arg PHP_VERSION=8.5
 ```
 or set `PHP_VERSION` in `.env`. The image tag includes the version, so switching back and forth doesn't force a rebuild each time.
+
+Two details in the Dockerfile follow from supporting 8.5:
+
+- **OPcache is part of PHP itself from 8.5.** `docker-php-ext-install opcache` fails there, so the Dockerfile only builds it as a separate extension on 8.4 and older. `php -m` lists `Zend OPcache` on every version either way.
+- **Xdebug is pinned to the 3.5 line**, the first with PHP 8.5 support. APCu and Xdebug versions are `ARG`s at the top of the Dockerfile.
+
+The base image is pinned to Debian 13 with the `-trixie` tag suffix, so the OS under the image changes only when you change it.
 
 **A linter is not a substitute for this.** Code that passes `php -l` on 8.3 can still use syntax unavailable on 8.2 — and if your add-on advertises 8.2 support, only running it on 8.2 proves anything.
 
@@ -174,7 +181,9 @@ That is not a stylistic choice. A default password is how the environment this r
 container_name: ${COMPOSE_PREFIX:-xf}-mariadb
 ```
 
-Fixed container names make `docker exec` commands memorable, but they collide if you run two stacks. The prefix lets you run a 2.2 board and a 2.3 board side by side by changing one variable — along with `HTTP_PORT`.
+Fixed container names make `docker exec` commands memorable, but they collide if you run two stacks. To run a second stack — a 2.2 board beside a 2.3 board, say — give it its own checkout and set **three** variables in its `.env`: `COMPOSE_PREFIX` (container names), `COMPOSE_PROJECT_NAME` (the Compose project, and so the volume names) and `HTTP_PORT`.
+
+`COMPOSE_PREFIX` alone is not enough. Both stacks would still be the same Compose project, sharing one database volume and one search index, and bringing one up would recreate the other's containers. `COMPOSE_PROJECT_NAME` overrides the `name:` line in the compose file. Never change it on a stack that already holds data: the old volumes stay on disk under the old name and the stack starts empty.
 
 The helper scripts use `docker compose exec <service>` rather than `docker exec <container>` throughout, so they keep working whatever the prefix is.
 

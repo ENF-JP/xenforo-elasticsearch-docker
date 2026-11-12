@@ -7,6 +7,10 @@
 .env
 stack/.env
 *.env
+# Temp files the helper scripts write while rewriting .env (stack/.env.XXXXXX).
+# They hold the same secrets; one is left behind if a rewrite is interrupted.
+.env.*
+stack/.env.*
 !.env.example
 !stack/.env.example
 

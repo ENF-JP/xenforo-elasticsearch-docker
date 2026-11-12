@@ -1,0 +1,65 @@
+# Opens a "review the version pins" issue on the first day of each month.
+#
+# This is a reminder, not an updater. It lists the versions currently pinned
+# in stack/.env.example and the Dockerfile so a person can compare them with
+# upstream and decide. Nothing is changed automatically: an unattended
+# Elasticsearch or MariaDB major bump can break a stack in ways that only show
+# up after the data volume has been upgraded, which cannot be undone.
+#
+# Skips opening a new issue while the previous one is still open, so an
+# ignored reminder does not pile up into twelve.
+name: pin-review
+
+on:
+  schedule:
+    - cron: "0 3 1 * *"   # 03:00 UTC on the 1st of each month
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  open-issue:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: open the review issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -n "$(gh issue list --state open --label pin-review --json number --jq '.[].number')" ]; then
+            echo "A pin-review issue is already open; not opening another."
+            exit 0
+          fi
+          gh label create pin-review --color BFD4F2 --description "Monthly version pin review" 2>/dev/null || true
+
+          pins="$(grep -E '^(PHP_VERSION|ES_VERSION|MARIADB_VERSION|MAILPIT_VERSION)=' stack/.env.example)"
+          args="$(grep -E '^ARG (XDEBUG_VERSION|APCU_VERSION|PHP_VERSION)=' stack/Dockerfile)"
+
+          {
+            echo "Monthly reminder to compare the pinned versions with upstream. Nothing has been changed."
+            echo
+            echo '### Currently pinned'
+            echo '```'
+            echo "$pins"
+            echo "$args"
+            echo '```'
+            echo
+            # Quoted heredoc: the Markdown backticks below are literal text.
+            cat <<'CHECKLIST'
+          ### Check
+          - [ ] PHP: newest patch of each supported branch is what `php:<ver>-apache-trixie` resolves to (rebuild with `--pull`)
+          - [ ] Elasticsearch 8.19.x: newest patch at https://www.docker.elastic.co/r/elasticsearch/elasticsearch
+          - [ ] MariaDB: the pinned LTS line is still supported (https://mariadb.org/about/#maintenance-policy)
+          - [ ] Mailpit: newest release at https://github.com/axllent/mailpit/releases, especially security releases
+          - [ ] Xdebug and APCu: newest releases at https://pecl.php.net/package/xdebug and https://pecl.php.net/package/apcu
+          - [ ] Docker Engine minimum (28.3.3) still right: any newer CVE affecting published-port isolation?
+
+          If anything changes: update the pin, CHANGELOG.md and docs/upgrading.md in one pull request, and say whether the change is one-way for an existing data volume.
+          CHECKLIST
+          } > body.md
+
+          gh issue create --title "Review version pins ($(date -u +%Y-%m))" --label pin-review --body-file body.md

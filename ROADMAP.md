@@ -33,7 +33,7 @@ Testing an upgrade path (`1.0.7 → 1.0.8`) currently means a full `reset` and r
 
 ### 3. Multi-version matrix
 
-Run the same add-on against XenForo 2.2 and 2.3, or PHP 8.2/8.3/8.4, without hand-editing `.env`:
+Run the same add-on against XenForo 2.2 and 2.3, or PHP 8.2/8.3/8.4/8.5, without hand-editing `.env`:
 
 ```
 xf use xf22        # a named profile: different webroot, DB name, port
@@ -53,6 +53,8 @@ Careful about scope: enough to be useful, not a fixture framework.
 ## Tier 2 — worth doing, more effort or narrower audience
 
 ### 5. GitHub Actions workflow
+
+*Partly done in v1.1.0:* a lint workflow (shellcheck, PSScriptAnalyzer, hadolint, compose validation and a loopback-binding check) runs on every push and pull request. What remains is the part below.
 
 A reusable workflow that stands the stack up on `ubuntu-latest`, installs the add-on and runs `verify`. The main obstacle is XenForo licensing: CI needs the source, which can't be committed. Practical route is a repository secret holding a URL to a private artifact, documented but necessarily left to the user.
 
@@ -90,7 +92,9 @@ Someone will ask. For a single-developer local environment, Compose is the right
 
 ### 13. Auto-updating pinned image versions
 
-Renovate or Dependabot could bump `mariadb:11.4` and `elasticsearch:8.15.0` automatically. Attractive, but an unattended Elasticsearch major bump can silently break XFES compatibility (it requires 7.2+ and treats OpenSearch as 7.10.2 regardless of its real version). Better as a **scheduled reminder to review**, not an auto-merge.
+Renovate or Dependabot could bump `mariadb:11.4` and `elasticsearch:8.19.25` automatically. Attractive, but an unattended Elasticsearch major bump can silently break XFES compatibility (it requires 7.2+ and treats OpenSearch as 7.10.2 regardless of its real version). Better as a **scheduled reminder to review**, not an auto-merge.
+
+**Done in v1.1.0, in the review-only form.** A scheduled workflow opens a pin-review issue on the 1st of each month listing every pinned version, with a checklist; a person decides. Dependabot covers only the GitHub Actions pins: the image versions live in `.env` variables and Dockerfile `ARG`s, which it cannot read.
 
 ### 14. Windows containers
 

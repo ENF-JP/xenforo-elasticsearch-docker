@@ -33,15 +33,15 @@ colima start --cpu 4 --memory 8 --disk 60 --vm-type=vz --mount-type=virtiofs
 Verify:
 
 ```bash
-docker version
-docker compose version
+docker version --format '{{.Server.Version}}'   # 28.3.3 or later
+docker compose version                           # v2 or later
 ```
 
 ---
 
 ## 2. Apple Silicon
 
-The images this stack uses all publish `linux/arm64` variants — `php:8.3-apache`, `mariadb:11.4`, and Elasticsearch since 7.17. Everything runs natively on M-series hardware; there is no Rosetta emulation involved and no `platform:` override needed.
+The images this stack uses all publish `linux/arm64` variants — `php:8.4-apache-trixie`, `mariadb:11.4`, and Elasticsearch since 7.17. Everything runs natively on M-series hardware; there is no Rosetta emulation involved and no `platform:` override needed.
 
 Two things to know:
 
@@ -70,14 +70,14 @@ $EDITOR stack/.env          # set XF_SOURCE to your licensed XenForo files
 
 ### bash version
 
-macOS ships **bash 3.2** (2007) because of GPLv3 licensing. `xf.sh` uses arrays and `[[ ]]` in ways bash 3.2 handles, but it is developed against bash 4+ and not regression-tested on 3.2. If you hit a syntax error:
+macOS ships **bash 3.2** (2007) because of GPLv3 licensing. `xf.sh` runs on it as shipped: since v1.1.0 it is parsed, and its version-sensitive functions are tested, under bash 3.2.57 before release.
+
+Versions before v1.1.0 failed on stock macOS bash with `user[@]: unbound variable` the first time a command needed root in the container (`setup`, `xdebug`), because bash older than 4.4 treats an empty array as unset under `set -u`. If you are on an older checkout, update it, or run it with a newer bash:
 
 ```bash
 brew install bash
 /opt/homebrew/bin/bash ./scripts/linux/xf.sh setup
 ```
-
-The `#!/usr/bin/env bash` shebang picks up the Homebrew build automatically once it precedes `/bin/bash` on your `PATH`.
 
 `zsh` is macOS's default *interactive* shell, which is irrelevant here — the script declares its own interpreter.
 
